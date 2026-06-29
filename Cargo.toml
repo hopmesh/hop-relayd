@@ -1,0 +1,32 @@
+[package]
+name = "hop-relayd"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Hop cloud relay daemon — an always-on node bridging local meshes over the internet (DESIGN.md §19, §21)."
+
+[[bin]]
+name = "hop-relayd"
+path = "src/main.rs"
+
+[dependencies]
+hop-core.workspace = true
+hop-store-sqlite.workspace = true
+hop-store-firestore = { workspace = true, optional = true }
+bs58 = "0.5"
+blake3.workspace = true
+# Sync WebSocket bearer. Default features = handshake only (no TLS): the global
+# load balancer terminates TLS, so the daemon speaks plain ws:// on $PORT.
+tungstenite = "0.24"
+# HNS resolver (DESIGN.md §30): the cloud relay resolves `_hopaddress.<domain>` TXT over
+# DNS-over-HTTPS for peers that ask it. Only in the cloud (firestore) build.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# Off by default so a plain VM build stays lean (no reqwest/rustls/tokio). Enable
+# for the scale-to-zero Cloud Run deploy that needs the durable Firestore mailbox
+# and the backbone (registry heartbeat + pull-on-wake dialing of wss:// peers, which
+# needs a TLS WebSocket client).
+firestore = ["dep:hop-store-firestore", "dep:reqwest", "dep:serde_json", "tungstenite/rustls-tls-webpki-roots"]
