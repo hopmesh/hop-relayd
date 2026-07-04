@@ -42,6 +42,32 @@ use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
+/// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
+/// stops advancing, so Cloud Run restarts a wedged instance instead of the default TCP check passing
+/// forever (with one instance per region, a wedged instance IS the region). `0` = not started yet.
+static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+/// A driver that hasn't ticked in this long is considered wedged (the loop times out every ≤1s).
+const HEALTHZ_STALE_MS: u64 = 30_000;
+
+/// F-21: set by the SIGTERM handler. The single-owner driver loop checks it each iteration and, on
+/// shutdown, drains the durable store before exiting so a spool/handoff write accepted moments before
+/// Cloud Run reaps the instance isn't lost.
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_sigterm(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Install the SIGTERM (and SIGINT) handler. Async-signal-safe: it only sets an atomic.
+fn install_shutdown_handler() {
+    // Coerce to a fn pointer before the numeric cast (fn *item* → integer is a clippy lint).
+    let handler = on_sigterm as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
 /// Events the driver loop processes (one owner of the node, no locks). Each live
 /// connection hands the driver a `Sender` it pushes outgoing link packets into;
 /// the connection's own thread owns the transport and does the writing.
@@ -127,6 +153,22 @@ fn netlog(line: impl Into<String>) {
     log_hub().emit(line.into());
 }
 
+/// F-17: liveness probe. 200 only if the driver loop ticked within [`HEALTHZ_STALE_MS`]; else 503,
+/// so Cloud Run's startup/liveness probe restarts a wedged instance. This is a container-level probe
+/// (Cloud Run hits it internally); do NOT wire an external uptime check against region endpoints —
+/// DESIGN.md §1436 forbids externally probing regions because it wakes scaled-to-zero instances.
+fn serve_healthz(mut stream: TcpStream) {
+    let last = LAST_TICK_MS.load(Ordering::Relaxed);
+    let healthy = last != 0 && now_ms().saturating_sub(last) < HEALTHZ_STALE_MS;
+    let (status, body) = if healthy { ("200 OK", "ok") } else { ("503 Service Unavailable", "stale") };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
 /// Stream the live network log to a plain-HTTP visitor (text/plain, incremental). Leads
 /// with this node's identity so a visitor to the anycast name sees which region answered.
 fn serve_log_stream(mut stream: TcpStream) {
@@ -168,6 +210,7 @@ fn serve_log_stream(mut stream: TcpStream) {
 }
 
 fn main() {
+    install_shutdown_handler(); // F-21: drain the durable store on SIGTERM before the instance is reaped
     let mut listen: Option<String> = None;
     let mut ws: Option<String> = None;
     let mut db = "hop-relay.db".to_string();
@@ -364,6 +407,17 @@ fn main() {
     #[cfg(feature = "firestore")]
     let mut last_handoff_ms: u64 = 0;
     loop {
+        // F-17: heartbeat for /healthz. The loop iterates at least once per second (recv timeout →
+        // tick); if node.handle/tick ever deadlocks, this stops advancing and /healthz goes 503.
+        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+        // F-21: on SIGTERM, drain the durable store's pending mirror queue before exiting, so a
+        // spool/handoff write accepted just before Cloud Run reaps us survives. Cloud Run grants a
+        // grace window on shutdown; bound the flush well inside it.
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            let flushed = node.store.flush(Duration::from_secs(8));
+            netlog(format!("SIGTERM: durable-store flush {} — exiting", if flushed { "drained" } else { "timed out" }));
+            break;
+        }
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(Ev::Up(link, role, out)) => {
                 writers.insert(link, out);
@@ -528,6 +582,12 @@ fn serve_ws(stream: TcpStream, ev_tx: &Sender<Ev>) {
         match stream.peek(&mut head) {
             Ok(n) if n > 0 => {
                 let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+                // F-17: a real health probe, tied to the driver loop's heartbeat — distinct from the
+                // log stream, which stays up even if the driver deadlocks and so is NOT a health signal.
+                if req.contains("get /healthz") {
+                    serve_healthz(stream);
+                    return;
+                }
                 if !req.contains("upgrade: websocket") {
                     serve_log_stream(stream);
                     return;
@@ -971,61 +1031,17 @@ mod handoff {
                         }
                     }
 
-                    // §39 P5 blind spool: a private bundle with no live recv-gradient anywhere
-                    // we can see is durably held by its mailbox-tag — a rotatable pseudonym, not
-                    // an address — so an offline recipient can pull it when they next surface.
-                    // (Spool XOR live-route: the driver only lists bundles whose gradient is
-                    // absent/expired, so we never double-store something already in flight.)
-                    for (id, tag, bytes, expires) in &snap.spool {
-                        if !spooled.insert((*id, *tag)) {
-                            continue; // already spooled this cycle-set
-                        }
-                        let tag_b58 = bs58::encode(tag).into_string();
-                        if let Err(e) = presence.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
-                            super::netlog(format!(
-                                "spool FAILED: msg {} → mailbox {}: {e}",
-                                super::short_b58(id),
-                                &tag_b58[..tag_b58.len().min(8)]
-                            ));
-                            spooled.remove(&(*id, *tag)); // let a later cycle retry
-                        } else {
-                            super::netlog(format!(
-                                "spool: msg {} → mailbox {}",
-                                super::short_b58(id),
-                                &tag_b58[..tag_b58.len().min(8)]
-                            ));
-                        }
-                    }
-
-                    // §39 P5 want-beacon: a mailbox-tag whose recv-gradient we just laid means
-                    // that recipient is reachable again. Pull anything spooled under the tag and
-                    // re-ingest it — P4's live gradient then steers each bundle down to them —
-                    // and drop the spool copy (idempotent; TTL sweeps anything we miss).
-                    for tag in &snap.wanted {
-                        let tag_b58 = bs58::encode(tag).into_string();
-                        let held = match presence.list_mailbox(&tag_b58) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("spool: list_mailbox failed: {e}");
-                                continue;
-                            }
-                        };
-                        for (bytes, _expires) in held {
-                            let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
-                                continue;
-                            };
-                            let id = b.id();
-                            if pulled.insert(id) {
-                                super::netlog(format!(
-                                    "want-beacon: pulled msg {} from mailbox {}",
-                                    super::short_b58(&id),
-                                    &tag_b58[..tag_b58.len().min(8)]
-                                ));
-                                if ev_tx.send(Ev::Ingest(bytes)).is_err() {
-                                    return; // driver gone
-                                }
-                            }
-                            let _ = presence.delete_mailbox_bundle(&tag_b58, &id);
+                    // §39 P5 spool + want-beacon, extracted into a store-agnostic function so the
+                    // cross-region round trip is unit-testable with a fake shared mailbox (F-18).
+                    for bytes in process_mailbox(
+                        &presence,
+                        &snap.spool,
+                        &snap.wanted,
+                        &mut spooled,
+                        &mut pulled,
+                    ) {
+                        if ev_tx.send(Ev::Ingest(bytes)).is_err() {
+                            return; // driver gone
                         }
                     }
                 }
@@ -1060,5 +1076,153 @@ mod handoff {
         }
 
         snap_tx
+    }
+
+    /// The durable blind-spool mailbox operations the §39 P5 worker needs (F-18). Abstracting these
+    /// out of the concrete Firestore [`Presence`] makes the cross-region spool→pull round trip
+    /// testable with an in-memory fake that two "regions" share.
+    pub trait MailboxStore {
+        fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String>;
+        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String>;
+        fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
+    }
+
+    impl MailboxStore for Presence {
+        fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String> {
+            Presence::spool_to_mailbox(self, tag_b58, id, data, expires_at)
+        }
+        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
+            Presence::list_mailbox(self, tag_b58)
+        }
+        fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
+            Presence::delete_mailbox_bundle(self, tag_b58, id)
+        }
+    }
+
+    /// §39 P5 spool + want-beacon, store-agnostic. Spools each un-routable private bundle by its
+    /// mailbox-tag; for each wanted tag, pulls anything held under it, dedups by id, deletes the
+    /// spool copy, and returns the bytes to re-ingest. `spooled`/`pulled` carry cross-cycle dedup.
+    pub fn process_mailbox<M: MailboxStore>(
+        store: &M,
+        spool: &[(BundleId, Tag, Vec<u8>, u64)],
+        wanted: &[Tag],
+        spooled: &mut HashSet<(BundleId, Tag)>,
+        pulled: &mut HashSet<BundleId>,
+    ) -> Vec<Vec<u8>> {
+        for (id, tag, bytes, expires) in spool {
+            if !spooled.insert((*id, *tag)) {
+                continue; // already spooled this cycle-set
+            }
+            let tag_b58 = bs58::encode(tag).into_string();
+            if let Err(e) = store.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
+                super::netlog(format!("spool FAILED: msg {} → mailbox {}: {e}", super::short_b58(id), &tag_b58[..tag_b58.len().min(8)]));
+                spooled.remove(&(*id, *tag)); // let a later cycle retry
+            } else {
+                super::netlog(format!("spool: msg {} → mailbox {}", super::short_b58(id), &tag_b58[..tag_b58.len().min(8)]));
+            }
+        }
+
+        let mut ingest = Vec::new();
+        for tag in wanted {
+            let tag_b58 = bs58::encode(tag).into_string();
+            let held = match store.list_mailbox(&tag_b58) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("spool: list_mailbox failed: {e}");
+                    continue;
+                }
+            };
+            for (bytes, _expires) in held {
+                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else { continue };
+                let id = b.id();
+                if pulled.insert(id) {
+                    super::netlog(format!("want-beacon: pulled msg {} from mailbox {}", super::short_b58(&id), &tag_b58[..tag_b58.len().min(8)]));
+                    ingest.push(bytes);
+                }
+                let _ = store.delete_mailbox_bundle(&tag_b58, &id);
+            }
+        }
+        ingest
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// One shared in-memory Firestore-like mailbox store; two `RegionWorker`s over the SAME
+        /// instance simulate region A spooling and region B pulling (the cross-region path).
+        #[derive(Default)]
+        struct FakeMailbox {
+            // tag_b58 → (bundle-id → bytes)
+            boxes: Mutex<HashMap<String, HashMap<BundleId, Vec<u8>>>>,
+        }
+        impl MailboxStore for FakeMailbox {
+            fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], _e: u64) -> Result<(), String> {
+                self.boxes.lock().unwrap().entry(tag_b58.to_string()).or_default().insert(*id, data.to_vec());
+                Ok(())
+            }
+            fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
+                Ok(self.boxes.lock().unwrap().get(tag_b58).map(|m| m.values().map(|v| (v.clone(), 0)).collect()).unwrap_or_default())
+            }
+            fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
+                if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) { m.remove(id); }
+                Ok(())
+            }
+        }
+
+        fn private_bundle_for(spk_pub: &hop_core::crypto::XPubKeyBytes, seal_to: &PubKeyBytes) -> (BundleId, Tag, Vec<u8>) {
+            use hop_core::bundle::{Bundle, BundleOpts, Payload};
+            // F-06: the mailbox tag is derived from the recipient address + epoch (epoch 0 here).
+            let mailbox = hop_core::crypto::mailbox_tag(seal_to, 0);
+            let b = Bundle::create_private(
+                seal_to, spk_pub,
+                &Payload::PeerMessage { content_type: "t".into(), body: b"cross-region".to_vec() },
+                Some(mailbox), BundleOpts::default(),
+            ).unwrap();
+            (b.id(), mailbox, b.to_bytes().unwrap())
+        }
+
+        #[test]
+        fn cross_region_spool_then_want_beacon_pulls_exactly_once() {
+            use hop_core::prelude::Identity;
+            let store = FakeMailbox::default();
+            let bob = Identity::generate();
+            let spk = bob.derive_prekey();
+            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
+
+            // Region A: no live gradient → spool the bundle. Its own dedup sets.
+            let (mut sp_a, mut pl_a) = (HashSet::new(), HashSet::new());
+            let out_a = process_mailbox(&store, &[(id, tag, bytes.clone(), 0)], &[], &mut sp_a, &mut pl_a);
+            assert!(out_a.is_empty(), "spooling ingests nothing");
+            assert_eq!(store.list_mailbox(&bs58::encode(tag).into_string()).unwrap().len(), 1, "bundle is durably spooled by mailbox-tag");
+
+            // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
+            let (mut sp_b, mut pl_b) = (HashSet::new(), HashSet::new());
+            let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
+            assert_eq!(out_b.len(), 1, "want-beacon in region B pulls the bundle spooled in region A");
+            assert_eq!(hop_core::bundle::Bundle::from_bytes(&out_b[0]).unwrap().id(), id, "pulled the right bundle");
+
+            // Exactly once: the spool copy is deleted, so a re-beacon (even a fresh worker) pulls nothing.
+            assert!(store.list_mailbox(&bs58::encode(tag).into_string()).unwrap().is_empty(), "spool copy deleted after pull");
+            let (mut sp_c, mut pl_c) = (HashSet::new(), HashSet::new());
+            assert!(process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(), "no double-delivery on re-beacon");
+        }
+
+        #[test]
+        fn same_worker_pull_dedups_within_its_pulled_set() {
+            use hop_core::prelude::Identity;
+            let store = FakeMailbox::default();
+            let bob = Identity::generate();
+            let spk = bob.derive_prekey();
+            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
+            let (mut sp, mut pl) = (HashSet::new(), HashSet::new());
+            process_mailbox(&store, &[(id, tag, bytes, 0)], &[], &mut sp, &mut pl);
+            // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
+            let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
+            let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
+            assert!(again.is_empty(), "a bundle id already pulled by this worker is not re-ingested");
+        }
     }
 }

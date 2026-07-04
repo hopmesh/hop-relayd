@@ -12,8 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 hop-core.workspace = true
-hop-store-sqlite.workspace = true
+# plain SQLite (the relay never needs at-rest encryption; its store is a transient mailbox cache)
+hop-store-sqlite = { workspace = true, features = ["bundled"] }
 hop-store-firestore = { workspace = true, optional = true }
+# SIGTERM handler so a Cloud Run shutdown drains the durable-store queue before the instance is
+# reaped (F-21). libc is already in the tree transitively.
+libc = "0.2"
 bs58 = "0.5"
 blake3.workspace = true
 # Sync WebSocket bearer. Default features = handshake only (no TLS): the global
