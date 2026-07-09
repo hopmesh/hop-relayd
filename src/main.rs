@@ -87,7 +87,10 @@ enum Ev {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 /// UTC `HH:MM:SS` from epoch ms (for the log stream).
@@ -144,7 +147,11 @@ static LOG: OnceLock<LogHub> = OnceLock::new();
 
 fn log_hub() -> &'static LogHub {
     LOG.get_or_init(|| LogHub {
-        inner: Mutex::new(LogInner { who: String::new(), ring: VecDeque::new(), subs: Vec::new() }),
+        inner: Mutex::new(LogInner {
+            who: String::new(),
+            ring: VecDeque::new(),
+            subs: Vec::new(),
+        }),
     })
 }
 
@@ -160,7 +167,11 @@ fn netlog(line: impl Into<String>) {
 fn serve_healthz(mut stream: TcpStream) {
     let last = LAST_TICK_MS.load(Ordering::Relaxed);
     let healthy = last != 0 && now_ms().saturating_sub(last) < HEALTHZ_STALE_MS;
-    let (status, body) = if healthy { ("200 OK", "ok") } else { ("503 Service Unavailable", "stale") };
+    let (status, body) = if healthy {
+        ("200 OK", "ok")
+    } else {
+        ("503 Service Unavailable", "stale")
+    };
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -179,8 +190,15 @@ fn serve_log_stream(mut stream: TcpStream) {
     if stream.write_all(header.as_bytes()).is_err() {
         return;
     }
-    let who = if who.is_empty() { "(starting)".to_string() } else { who };
-    if stream.write_all(format!("== hop relay :: {who} ==\n").as_bytes()).is_err() {
+    let who = if who.is_empty() {
+        "(starting)".to_string()
+    } else {
+        who
+    };
+    if stream
+        .write_all(format!("== hop relay :: {who} ==\n").as_bytes())
+        .is_err()
+    {
         return;
     }
     for line in backlog {
@@ -195,7 +213,9 @@ fn serve_log_stream(mut stream: TcpStream) {
     loop {
         match rx.recv_timeout(Duration::from_secs(15)) {
             Ok(line) => {
-                if stream.write_all(format!("{line}\n").as_bytes()).is_err() || stream.flush().is_err() {
+                if stream.write_all(format!("{line}\n").as_bytes()).is_err()
+                    || stream.flush().is_err()
+                {
                     break;
                 }
             }
@@ -255,7 +275,10 @@ fn main() {
     // liveness-registry entry) without needing a separate secret per region (§27/§28).
     if let Some(r) = &region {
         identity = Identity::from_secret_bytes(&region_seed(&base_seed, r));
-        println!("hop-relayd: region={r} derived address {}", bs58_addr(&identity.address()));
+        println!(
+            "hop-relayd: region={r} derived address {}",
+            bs58_addr(&identity.address())
+        );
     }
     let addr = identity.address();
     let store = build_store(&firestore, &db, &addr);
@@ -283,8 +306,13 @@ fn main() {
     println!(
         "hop-relayd: address {} {}{}{} backbone peer(s)",
         bs58_addr(&addr),
-        listen.as_deref().map(|l| format!("tcp {l} ")).unwrap_or_default(),
-        ws.as_deref().map(|w| format!("ws {w} ")).unwrap_or_default(),
+        listen
+            .as_deref()
+            .map(|l| format!("tcp {l} "))
+            .unwrap_or_default(),
+        ws.as_deref()
+            .map(|w| format!("ws {w} "))
+            .unwrap_or_default(),
         peers.len(),
     );
     // Identify this node in the live HTTP log stream (so a visitor to the anycast name
@@ -294,7 +322,11 @@ fn main() {
         region.as_deref().unwrap_or("local"),
         bs58_addr(&addr)
     ));
-    netlog(format!("relay up: region={} node={}", region.as_deref().unwrap_or("local"), bs58_addr(&addr)));
+    netlog(format!(
+        "relay up: region={} node={}",
+        region.as_deref().unwrap_or("local"),
+        bs58_addr(&addr)
+    ));
 
     let (tx, rx) = mpsc::channel::<Ev>();
 
@@ -393,7 +425,10 @@ fn main() {
                 .expect("dns http client");
             for domain in drx {
                 let bodies = fetch_dnssec_chain(&http, &domain);
-                netlog(format!("hns: fetched {} chain records for {domain}", bodies.len()));
+                netlog(format!(
+                    "hns: fetched {} chain records for {domain}",
+                    bodies.len()
+                ));
                 let _ = ev_tx.send(Ev::DnsProof(domain, bodies));
             }
         });
@@ -415,7 +450,10 @@ fn main() {
         // grace window on shutdown; bound the flush well inside it.
         if SHUTDOWN.load(Ordering::SeqCst) {
             let flushed = node.store.flush(Duration::from_secs(8));
-            netlog(format!("SIGTERM: durable-store flush {} — exiting", if flushed { "drained" } else { "timed out" }));
+            netlog(format!(
+                "SIGTERM: durable-store flush {} — exiting",
+                if flushed { "drained" } else { "timed out" }
+            ));
             break;
         }
         match rx.recv_timeout(Duration::from_millis(1000)) {
@@ -435,6 +473,7 @@ fn main() {
                     let dst = match b.inner.dst {
                         Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
                         Destination::Broadcast => "broadcast".to_string(),
+                        Destination::Vaccine(..) => "vaccine".to_string(),
                     };
                     netlog(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
                     node.ingest(b);
@@ -472,7 +511,11 @@ fn main() {
         let now = now_ms();
         if now.saturating_sub(last_stats_ms) >= 10_000 {
             last_stats_ms = now;
-            netlog(format!("stats: peers={} held={}", node.peers().len(), node.queue().len()));
+            netlog(format!(
+                "stats: peers={} held={}",
+                node.peers().len(),
+                node.queue().len()
+            ));
         }
 
         // Feed the handoff worker a fresh snapshot of who's connected and what we can't
@@ -602,7 +645,9 @@ fn serve_ws(stream: TcpStream, ev_tx: &Sender<Ev>) {
         Err(_) => return, // malformed upgrade
     };
     // A read timeout lets the single owner thread interleave writes with reads.
-    let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = ws
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)));
 
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
@@ -682,7 +727,8 @@ fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
             match out_rx.try_recv() {
                 Ok(bytes) => match ws.write(Message::Binary(bytes)) {
                     Ok(()) => {}
-                    Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(tungstenite::Error::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break 'conn,
                 },
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -734,7 +780,9 @@ fn build_store(firestore: &Option<String>, db: &str, addr: &[u8]) -> Box<dyn Sto
 #[cfg(not(feature = "firestore"))]
 fn build_store(firestore: &Option<String>, db: &str, _addr: &[u8]) -> Box<dyn Store> {
     if firestore.is_some() {
-        eprintln!("firestore support not compiled in (build with --features firestore); using sqlite");
+        eprintln!(
+            "firestore support not compiled in (build with --features firestore); using sqlite"
+        );
     }
     Box::new(SqliteStore::open(db).expect("open sqlite store"))
 }
@@ -808,7 +856,10 @@ fn fetch_dnssec_chain(http: &reqwest::blocking::Client, domain: &str) -> Vec<Str
 /// The host of a `wss://`/`ws://` URL — the relay's identify name (DESIGN.md §29).
 /// `wss://us-central1.relay.hopme.sh/` → `us-central1.relay.hopme.sh`.
 fn host_of(url: &str) -> String {
-    let s = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://")).unwrap_or(url);
+    let s = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .unwrap_or(url);
     s.split('/').next().unwrap_or(s).to_string()
 }
 
@@ -852,7 +903,11 @@ mod backbone {
         known_relays.lock().unwrap().insert(me.clone());
         eprintln!(
             "backbone: region={region} advertise={advertise} mesh-fanout={fanout}{}",
-            if fanout == 0 { " (handoff-only, no dialing)" } else { " (online-only epidemic)" }
+            if fanout == 0 {
+                " (handoff-only, no dialing)"
+            } else {
+                " (online-only epidemic)"
+            }
         );
 
         // Announce our liveness so tooling/handoff can see which regions are warm.
@@ -891,7 +946,8 @@ mod backbone {
                                 continue;
                             }
                             held.insert(p.endpoint.clone());
-                            let (ep, ev_tx, dialed) = (p.endpoint.clone(), ev_tx.clone(), dialed.clone());
+                            let (ep, ev_tx, dialed) =
+                                (p.endpoint.clone(), ev_tx.clone(), dialed.clone());
                             std::thread::spawn(move || {
                                 super::dial_peer(&ep, &ev_tx);
                                 dialed.lock().unwrap().remove(&ep); // link closed — re-dial if still online
@@ -1082,13 +1138,25 @@ mod handoff {
     /// out of the concrete Firestore [`Presence`] makes the cross-region spool→pull round trip
     /// testable with an in-memory fake that two "regions" share.
     pub trait MailboxStore {
-        fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String>;
+        fn spool_to_mailbox(
+            &self,
+            tag_b58: &str,
+            id: &BundleId,
+            data: &[u8],
+            expires_at: u64,
+        ) -> Result<(), String>;
         fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String>;
         fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
     }
 
     impl MailboxStore for Presence {
-        fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], expires_at: u64) -> Result<(), String> {
+        fn spool_to_mailbox(
+            &self,
+            tag_b58: &str,
+            id: &BundleId,
+            data: &[u8],
+            expires_at: u64,
+        ) -> Result<(), String> {
             Presence::spool_to_mailbox(self, tag_b58, id, data, expires_at)
         }
         fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
@@ -1115,10 +1183,18 @@ mod handoff {
             }
             let tag_b58 = bs58::encode(tag).into_string();
             if let Err(e) = store.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
-                super::netlog(format!("spool FAILED: msg {} → mailbox {}: {e}", super::short_b58(id), &tag_b58[..tag_b58.len().min(8)]));
+                super::netlog(format!(
+                    "spool FAILED: msg {} → mailbox {}: {e}",
+                    super::short_b58(id),
+                    &tag_b58[..tag_b58.len().min(8)]
+                ));
                 spooled.remove(&(*id, *tag)); // let a later cycle retry
             } else {
-                super::netlog(format!("spool: msg {} → mailbox {}", super::short_b58(id), &tag_b58[..tag_b58.len().min(8)]));
+                super::netlog(format!(
+                    "spool: msg {} → mailbox {}",
+                    super::short_b58(id),
+                    &tag_b58[..tag_b58.len().min(8)]
+                ));
             }
         }
 
@@ -1133,10 +1209,16 @@ mod handoff {
                 }
             };
             for (bytes, _expires) in held {
-                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else { continue };
+                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
+                    continue;
+                };
                 let id = b.id();
                 if pulled.insert(id) {
-                    super::netlog(format!("want-beacon: pulled msg {} from mailbox {}", super::short_b58(&id), &tag_b58[..tag_b58.len().min(8)]));
+                    super::netlog(format!(
+                        "want-beacon: pulled msg {} from mailbox {}",
+                        super::short_b58(&id),
+                        &tag_b58[..tag_b58.len().min(8)]
+                    ));
                     ingest.push(bytes);
                 }
                 let _ = store.delete_mailbox_bundle(&tag_b58, &id);
@@ -1159,28 +1241,56 @@ mod handoff {
             boxes: Mutex<HashMap<String, HashMap<BundleId, Vec<u8>>>>,
         }
         impl MailboxStore for FakeMailbox {
-            fn spool_to_mailbox(&self, tag_b58: &str, id: &BundleId, data: &[u8], _e: u64) -> Result<(), String> {
-                self.boxes.lock().unwrap().entry(tag_b58.to_string()).or_default().insert(*id, data.to_vec());
+            fn spool_to_mailbox(
+                &self,
+                tag_b58: &str,
+                id: &BundleId,
+                data: &[u8],
+                _e: u64,
+            ) -> Result<(), String> {
+                self.boxes
+                    .lock()
+                    .unwrap()
+                    .entry(tag_b58.to_string())
+                    .or_default()
+                    .insert(*id, data.to_vec());
                 Ok(())
             }
             fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-                Ok(self.boxes.lock().unwrap().get(tag_b58).map(|m| m.values().map(|v| (v.clone(), 0)).collect()).unwrap_or_default())
+                Ok(self
+                    .boxes
+                    .lock()
+                    .unwrap()
+                    .get(tag_b58)
+                    .map(|m| m.values().map(|v| (v.clone(), 0)).collect())
+                    .unwrap_or_default())
             }
             fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
-                if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) { m.remove(id); }
+                if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) {
+                    m.remove(id);
+                }
                 Ok(())
             }
         }
 
-        fn private_bundle_for(spk_pub: &hop_core::crypto::XPubKeyBytes, seal_to: &PubKeyBytes) -> (BundleId, Tag, Vec<u8>) {
+        fn private_bundle_for(
+            spk_pub: &hop_core::crypto::XPubKeyBytes,
+            seal_to: &PubKeyBytes,
+        ) -> (BundleId, Tag, Vec<u8>) {
             use hop_core::bundle::{Bundle, BundleOpts, Payload};
             // F-06: the mailbox tag is derived from the recipient address + epoch (epoch 0 here).
             let mailbox = hop_core::crypto::mailbox_tag(seal_to, 0);
             let b = Bundle::create_private(
-                seal_to, spk_pub,
-                &Payload::PeerMessage { content_type: "t".into(), body: b"cross-region".to_vec() },
-                Some(mailbox), BundleOpts::default(),
-            ).unwrap();
+                seal_to,
+                spk_pub,
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b"cross-region".to_vec(),
+                },
+                Some(mailbox),
+                BundleOpts::default(),
+            )
+            .unwrap();
             (b.id(), mailbox, b.to_bytes().unwrap())
         }
 
@@ -1194,20 +1304,52 @@ mod handoff {
 
             // Region A: no live gradient → spool the bundle. Its own dedup sets.
             let (mut sp_a, mut pl_a) = (HashSet::new(), HashSet::new());
-            let out_a = process_mailbox(&store, &[(id, tag, bytes.clone(), 0)], &[], &mut sp_a, &mut pl_a);
+            let out_a = process_mailbox(
+                &store,
+                &[(id, tag, bytes.clone(), 0)],
+                &[],
+                &mut sp_a,
+                &mut pl_a,
+            );
             assert!(out_a.is_empty(), "spooling ingests nothing");
-            assert_eq!(store.list_mailbox(&bs58::encode(tag).into_string()).unwrap().len(), 1, "bundle is durably spooled by mailbox-tag");
+            assert_eq!(
+                store
+                    .list_mailbox(&bs58::encode(tag).into_string())
+                    .unwrap()
+                    .len(),
+                1,
+                "bundle is durably spooled by mailbox-tag"
+            );
 
             // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
             let (mut sp_b, mut pl_b) = (HashSet::new(), HashSet::new());
             let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
-            assert_eq!(out_b.len(), 1, "want-beacon in region B pulls the bundle spooled in region A");
-            assert_eq!(hop_core::bundle::Bundle::from_bytes(&out_b[0]).unwrap().id(), id, "pulled the right bundle");
+            assert_eq!(
+                out_b.len(),
+                1,
+                "want-beacon in region B pulls the bundle spooled in region A"
+            );
+            assert_eq!(
+                hop_core::bundle::Bundle::from_bytes(&out_b[0])
+                    .unwrap()
+                    .id(),
+                id,
+                "pulled the right bundle"
+            );
 
             // Exactly once: the spool copy is deleted, so a re-beacon (even a fresh worker) pulls nothing.
-            assert!(store.list_mailbox(&bs58::encode(tag).into_string()).unwrap().is_empty(), "spool copy deleted after pull");
+            assert!(
+                store
+                    .list_mailbox(&bs58::encode(tag).into_string())
+                    .unwrap()
+                    .is_empty(),
+                "spool copy deleted after pull"
+            );
             let (mut sp_c, mut pl_c) = (HashSet::new(), HashSet::new());
-            assert!(process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(), "no double-delivery on re-beacon");
+            assert!(
+                process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
+                "no double-delivery on re-beacon"
+            );
         }
 
         #[test]
@@ -1222,7 +1364,10 @@ mod handoff {
             // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
             let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
             let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
-            assert!(again.is_empty(), "a bundle id already pulled by this worker is not re-ingested");
+            assert!(
+                again.is_empty(),
+                "a bundle id already pulled by this worker is not re-ingested"
+            );
         }
     }
 }

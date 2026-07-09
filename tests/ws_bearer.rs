@@ -82,8 +82,13 @@ fn message_round_trips_over_a_real_websocket() {
     node.publish_prekey().unwrap();
     node.handle(BearerEvent::Connected(1, Role::Initiator));
     // Content defers until the server's prekey gossips in over the link, then flushes (§25).
-    node.send_message(server_addr, "t".into(), b"hello over websocket".to_vec(), false)
-        .expect("send");
+    node.send_message(
+        server_addr,
+        "t".into(),
+        b"hello over websocket".to_vec(),
+        false,
+    )
+    .expect("send");
 
     let body = loop {
         pump(&mut node, &mut ws);
@@ -92,7 +97,9 @@ fn message_round_trips_over_a_real_websocket() {
         }
         // Give up if the server thread died.
         if server.is_finished() {
-            break done_rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            break done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default();
         }
     };
 
