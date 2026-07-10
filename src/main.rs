@@ -214,6 +214,12 @@ fn public_log_stream_enabled() -> bool {
     )
 }
 
+// Tests that mutate the process-global HOP_PUBLIC_LOG_STREAM env var live in separate test modules
+// but share one process; Rust runs test fns in parallel threads, so they would otherwise race on the
+// var (one test's set_var flips the flag mid-assert in another). Serialize them on this shared lock.
+#[cfg(test)]
+static PUBLIC_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct LogHub {
     inner: Mutex<LogInner>,
 }
@@ -1791,6 +1797,9 @@ mod log_privacy_tests {
         // services-03: without HOP_PUBLIC_LOG_STREAM the per-event backlog is withheld (a visitor
         // gets identity + aggregate counters, not the ring of individual lines). The env var is not
         // set in the test process, so subscribe() returns an empty backlog even with a full ring.
+        // Hold the shared env lock: a parallel test mutating HOP_PUBLIC_LOG_STREAM would otherwise
+        // flip the flag between remove_var and subscribe().
+        let _env = super::PUBLIC_LOG_ENV_LOCK.lock().unwrap();
         let hub = fresh_hub();
         hub.emit("conn up: link=1 (Responder)".to_string());
         hub.emit("stats: peers=1 held=0".to_string());
@@ -2184,6 +2193,9 @@ mod pure_helper_tests {
     fn public_log_stream_flag_reads_the_env() {
         // services-03: the public per-event stream is opt-in via HOP_PUBLIC_LOG_STREAM; only the
         // truthy values enable it, everything else (incl. unset) leaves it off.
+        // Hold the shared env lock so this test's set_var can't race a parallel test that reads the
+        // flag via subscribe().
+        let _env = PUBLIC_LOG_ENV_LOCK.lock().unwrap();
         for v in ["1", "true", "yes"] {
             std::env::set_var("HOP_PUBLIC_LOG_STREAM", v);
             assert!(public_log_stream_enabled(), "{v} enables the public stream");
