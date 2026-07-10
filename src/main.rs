@@ -517,46 +517,21 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-r3-01: classify the request (WS upgrade / healthz / log-stream) via a
-                // non-consuming peek BEFORE charging any budget, then admit against the RIGHT pool so
-                // idle log viewers can never starve mesh links. Only the peek itself is done inline
-                // (bounded, cheap); the long-lived handler runs on its own thread. Peek failures /
-                // over-budget shed the socket without spawning, keeping thread spawn bounded.
-                let kind = classify_ws_peek(&stream);
-                let guard = match kind {
-                    // Healthz answers immediately and closes: exempt from every budget so a real
-                    // liveness probe is NEVER shed at the cap (services-r3-04). No slot charged.
-                    WsKind::Healthz => {
-                        std::thread::spawn(move || serve_healthz(stream));
-                        continue;
-                    }
-                    // Log viewers charge their own small budget; over it, shed.
-                    WsKind::LogStream => match admit_log_conn() {
-                        Some(g) => g,
-                        None => {
-                            drop(stream);
-                            continue;
-                        }
-                    },
-                    // Real WS upgrade: a mesh link, charges the mesh budget; over it, shed.
-                    WsKind::Upgrade => match admit_conn() {
-                        Some(g) => g,
-                        None => {
-                            drop(stream);
-                            continue;
-                        }
-                    },
-                    // No data / empty probe: nothing to serve, no thread, no slot.
-                    WsKind::Empty => {
-                        drop(stream);
-                        continue;
-                    }
+                // services-r3-02: the peek+classify MUST NOT run on this accept thread. It has a
+                // multi-second read timeout, so one silent slowloris (connect, send nothing) would
+                // serially stall EVERY new accept here (mesh links, log viewers, healthz probes)
+                // behind its peek. So we admit a provisional mesh slot up front (this is the ceiling
+                // that keeps thread spawn bounded, since any inbound could be a mesh link) and spawn
+                // immediately; the peek/classify then runs on the WORKER thread, where a slowloris
+                // only stalls its own connection. The worker reconciles to the correct pool once it
+                // knows the kind (release + re-admit against the log budget, or release for
+                // healthz/empty), so per-pool accounting stays exactly as before.
+                let Some(guard) = admit_conn() else {
+                    drop(stream); // over the mesh cap: shed without spawning (bounded spawn)
+                    continue;
                 };
                 let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let _guard = guard;
-                    serve_ws(stream, kind, &tx)
-                });
+                std::thread::spawn(move || admit_and_serve_ws(stream, guard, &tx));
             }
         });
     }
@@ -862,6 +837,45 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
         let _ = stream.set_read_timeout(None);
     }
     kind
+}
+
+/// services-r3-02: runs on the spawned worker thread (NOT the accept loop). Peek-classifies the
+/// connection (the slow, timeout-bounded step, now off the accept path so a slowloris can't stall
+/// new accepts), reconciles the provisional mesh slot `guard` to the correct pool, then serves.
+///
+/// The caller already charged one MESH slot (`guard`) so thread spawn is bounded by the mesh cap.
+/// Here we fix up the accounting once the real kind is known, keeping per-pool budgets identical to
+/// the old inline classify:
+///   * `Healthz`  : exempt from every budget. Release the mesh slot and serve (never shed at the cap).
+///   * `LogStream`: charges the SMALL log budget, not mesh. Release the mesh slot; admit a log slot;
+///     if the log pool is full, shed (no mesh slot held, so log viewers can't camp mesh).
+///   * `Upgrade`  : a real mesh link. KEEP the mesh slot and serve.
+///   * `Empty`    : nothing to serve. Release the mesh slot and drop.
+fn admit_and_serve_ws(stream: TcpStream, guard: ConnGuard, ev_tx: &Sender<Ev>) {
+    let kind = classify_ws_peek(&stream);
+    match kind {
+        WsKind::Healthz => {
+            drop(guard); // liveness probe: exempt from budgets, don't hold a mesh slot
+            serve_healthz(stream);
+        }
+        WsKind::LogStream => {
+            drop(guard); // a log viewer must charge the log pool, never a mesh slot
+            let Some(log_guard) = admit_log_conn() else {
+                drop(stream); // log pool full: shed on the log budget
+                return;
+            };
+            let _log_guard = log_guard; // releases the log slot on drop (incl. panic unwind)
+            serve_ws(stream, kind, ev_tx);
+        }
+        WsKind::Upgrade => {
+            let _guard = guard; // a real mesh link keeps the mesh slot for its lifetime
+            serve_ws(stream, kind, ev_tx);
+        }
+        WsKind::Empty => {
+            drop(guard);
+            drop(stream); // no data / probe with no payload: nothing to serve
+        }
+    }
 }
 
 fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
@@ -1276,7 +1290,7 @@ mod handoff {
     use hop_core::crypto::{PubKeyBytes, Tag};
     use hop_store_firestore::Presence;
 
-    use super::{region_node_b58, Ev};
+    use super::{now_ms, region_node_b58, Ev};
 
     /// A device-presence record is trusted this long after check-in (matches the
     /// registry TTL — beyond it, we don't know where the device is, so we don't hand off).
@@ -1433,14 +1447,20 @@ mod handoff {
         {
             let presence = Presence::new(&project);
             std::thread::spawn(move || {
-                let mut ingested: HashSet<BundleId> = HashSet::new();
+                // services-r2-04: the reload dedup set was an unbounded HashSet<BundleId> that grew
+                // for the whole process lifetime (every handoff ever re-read stayed remembered). Give
+                // it the same age-based eviction as its handed/spooled/pulled siblings: key each id by
+                // the bundle's own expiry so an expired / TTL-swept bundle (which can never reappear
+                // in the partition) is forgotten, with a hard cap fallback. Bounded, not a leak.
+                let mut ingested: HashMap<BundleId, u64> = HashMap::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(RELOAD_SECS));
+                    evict_expired(&mut ingested, now_ms());
                     match presence.list_bundles_of(&me) {
                         Ok(bundles) => {
-                            for (bytes, _expires) in bundles {
+                            for (bytes, expires) in bundles {
                                 if let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) {
-                                    if !ingested.insert(b.id()) {
+                                    if ingested.insert(b.id(), expires).is_some() {
                                         continue; // already pushed to the driver
                                     }
                                     if ev_tx.send(Ev::Ingest(bytes)).is_err() {
@@ -2028,6 +2048,129 @@ mod control_path_tests {
         MAX_LOG_CONNS >= 1,
         "at least one viewer can still watch the log"
     );
+
+    #[test]
+    fn admit_and_serve_ws_runs_classify_off_the_accept_thread_and_reconciles_budgets() {
+        // services-r3-02: the accept loop now charges a PROVISIONAL mesh slot and hands the socket to
+        // admit_and_serve_ws on a worker thread, which does the (timeout-bounded, slowloris-prone)
+        // peek there instead of inline. The correctness we protect: reconciliation to the right pool.
+        //   * A LogStream reconciles OFF the mesh slot ONTO the log pool: while it serves, exactly one
+        //     LOG slot and ZERO extra mesh slots are held, so a slow log viewer can never camp mesh.
+        //   * A Healthz / Empty releases the mesh slot entirely (no leak).
+        // Before the fix, the classify ran on the accept thread (stalling all accepts) AND there was
+        // no worker-side reconciliation seam; this test locks in the new accounting.
+        use super::{
+            admit_and_serve_ws, admit_conn, ACTIVE_CONNS, ACTIVE_LOG_CONNS, MAX_CONNS,
+            MAX_LOG_CONNS,
+        };
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), 0, "clean start (mesh)");
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            0,
+            "clean start (log)"
+        );
+
+        // Helper: run admit_and_serve_ws on a worker (as the accept loop would), feeding it `req`.
+        // Returns once the handler returns (connection served + closed).
+        fn run(req: &[u8]) -> std::thread::JoinHandle<()> {
+            let guard = admit_conn().expect("provisional mesh slot admitted");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let req = req.to_vec();
+            std::thread::spawn(move || {
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.write_all(&req).unwrap();
+                // Drain to EOF so the handler completes (healthz writes then closes).
+                let mut sink = Vec::new();
+                let _ = c.read_to_end(&mut sink);
+            });
+            let (sock, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30)); // let the client send
+            let (ev_tx, _ev_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                admit_and_serve_ws(sock, guard, &ev_tx);
+            })
+        }
+
+        // Healthz: served with NO slot held afterward (provisional mesh slot released, not leaked).
+        run(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .join()
+            .unwrap();
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "healthz released the provisional mesh slot (no leak)"
+        );
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            0,
+            "healthz charged NO log slot either"
+        );
+
+        // Empty: a probe with no payload releases the mesh slot and serves nothing.
+        run(b"").join().unwrap();
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "empty probe released the provisional mesh slot"
+        );
+
+        // LogStream: while it serves, it holds a LOG slot and NO mesh slot, and the full mesh budget
+        // stays free (a real link is admissible even while a log viewer is being served). Use the
+        // short-deadline test seam so the log handler closes promptly.
+        std::env::set_var("HOP_LOG_STREAM_MAX_MS", "300");
+        let guard = admit_conn().expect("provisional mesh slot admitted");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let mut sink = Vec::new();
+            let _ = c.read_to_end(&mut sink); // block until the deadline closes the stream
+        });
+        let (sock, _) = listener.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || admit_and_serve_ws(sock, guard, &ev_tx));
+        // Give the worker time to classify + reconcile onto the log pool, then observe mid-serve.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "a log viewer holds NO mesh slot (reconciled off it), so mesh links are never starved"
+        );
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            1,
+            "a log viewer charges exactly one LOG slot"
+        );
+        // The whole mesh budget is free even while a log viewer is being served.
+        let mut mesh_guards = Vec::new();
+        for _ in 0..MAX_CONNS {
+            mesh_guards.push(admit_conn().expect("mesh link admissible while a log viewer serves"));
+        }
+        assert!(ACTIVE_LOG_CONNS.load(Ordering::SeqCst) <= MAX_LOG_CONNS);
+        mesh_guards.clear();
+        worker.join().unwrap();
+        client.join().unwrap();
+        std::env::remove_var("HOP_LOG_STREAM_MAX_MS");
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            0,
+            "log slot released when the viewer's deadline closed the stream"
+        );
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "no leaked mesh slots"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "firestore"))]
@@ -2053,6 +2196,44 @@ mod handoff_dedup_tests {
             "future entry kept (still deduped, not re-written)"
         );
         assert!(m.contains_key(&4), "never-expire entry kept");
+    }
+
+    #[test]
+    fn reload_ingest_dedup_map_evicts_expired_ids_so_it_is_bounded_not_a_leak() {
+        // The warm partition-reload thread used to accumulate an unbounded HashSet<BundleId> that
+        // grew for the whole process lifetime. It now keys each id by the bundle's own expiry and
+        // runs evict_expired every cycle, exactly like the handed/spooled/pulled dedup maps. This
+        // models that reload dedup: a bundle seen while still live is deduped (not re-ingested), but
+        // once its expiry passes the entry is dropped, so the map cannot grow without bound.
+        use hop_core::bundle::BundleId;
+        let id_a: BundleId = [1u8; 32];
+        let id_b: BundleId = [2u8; 32];
+        let mut ingested: HashMap<BundleId, u64> = HashMap::new();
+
+        // Cycle 1 at t=1000: both bundles present, both fresh (ingest once, remembered).
+        let mut t = 1_000u64;
+        evict_expired(&mut ingested, t);
+        assert!(ingested.insert(id_a, t + 100).is_none(), "a ingested once");
+        assert!(
+            ingested.insert(id_b, t + 5_000).is_none(),
+            "b ingested once"
+        );
+        // Same cycle re-read: both already remembered, so neither re-ingests.
+        assert!(ingested.insert(id_a, t + 100).is_some(), "a deduped");
+        assert!(ingested.insert(id_b, t + 5_000).is_some(), "b deduped");
+
+        // Cycle 2 at t=1200: a's bundle has expired and been TTL-swept from the partition. Age
+        // eviction drops a's entry so the map does not retain forever-dead ids; b is still live.
+        t = 1_200;
+        evict_expired(&mut ingested, t);
+        assert!(
+            !ingested.contains_key(&id_a),
+            "expired id forgotten (bounded, no leak)"
+        );
+        assert!(
+            ingested.contains_key(&id_b),
+            "still-live id kept (stays deduped)"
+        );
     }
 
     #[test]
