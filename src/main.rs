@@ -47,6 +47,14 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 /// single WS client could push a 64 MiB message that the TCP path would have rejected at 1 MiB.
 const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
 
+/// services-r2-02: the single frame-size predicate both the raw-TCP read loop and (via
+/// `WebSocketConfig`) the WS path enforce, extracted so the cap is unit-testable. A frame at or
+/// under the cap is accepted; anything larger is rejected (the connection is dropped). Keeping this a
+/// named helper means a regression that widens the cap fails a test rather than silently passing CI.
+fn frame_len_ok(n: usize) -> bool {
+    n <= MAX_FRAME_BYTES
+}
+
 /// services-04: cap concurrent inbound connections so the one-thread-per-connection accept loops
 /// can't be driven to thread/memory exhaustion on a single-instance region (the port endpoint's
 /// F-19 control, ported back to relayd). Over the cap we shed the socket rather than spawn.
@@ -705,7 +713,7 @@ fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
             break;
         }
         let n = u32::from_be_bytes(len) as usize;
-        if n > MAX_FRAME_BYTES {
+        if !frame_len_ok(n) {
             break; // frame too large; drop the connection
         }
         let mut buf = vec![0u8; n];
@@ -1137,7 +1145,7 @@ mod backbone {
 /// I/O runs here, off the single-owner driver thread.
 #[cfg(feature = "firestore")]
 mod handoff {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1153,6 +1161,35 @@ mod handoff {
     const PRESENCE_TTL_MS: u64 = 90_000;
     /// How often a warm node re-reads its own partition for handoffs others wrote.
     const RELOAD_SECS: u64 = 30;
+    /// services-r2-04: hard fallback cap on a dedup map. Age eviction (drop expired entries) is the
+    /// primary bound; this only triggers if a pathological set of all-far-future entries piles up,
+    /// evicting the nearest-to-expiry so memory stays bounded WITHOUT a wholesale clear() that would
+    /// let already-handed/-spooled bundles be redundantly rewritten to Firestore on the next cycle.
+    const DEDUP_CAP: usize = 100_000;
+
+    /// services-r2-04: evict dedup entries whose bundle has already expired (epoch-ms `<= now_ms`,
+    /// treating `0` as never-expire), then, if still over [`DEDUP_CAP`], evict the nearest-to-expiry
+    /// surplus. Age-based instead of the old wholesale `clear()`, so an expired/TTL-swept bundle is
+    /// forgotten (it can never be re-handed) while a still-live one stays deduped and is NOT
+    /// redundantly re-written every cycle.
+    pub(crate) fn evict_expired<K: Clone + std::hash::Hash + Eq>(
+        map: &mut HashMap<K, u64>,
+        now_ms: u64,
+    ) {
+        map.retain(|_, &mut exp| exp == 0 || exp > now_ms);
+        if map.len() > DEDUP_CAP {
+            let excess = map.len() - DEDUP_CAP;
+            // Collect the `excess` nearest-to-expiry keys (0 = never-expire sorts last).
+            let mut by_exp: Vec<(u64, K)> = map
+                .iter()
+                .map(|(k, &e)| (if e == 0 { u64::MAX } else { e }, k.clone()))
+                .collect();
+            by_exp.select_nth_unstable_by_key(excess.saturating_sub(1), |(e, _)| *e);
+            for (_, k) in by_exp.into_iter().take(excess) {
+                map.remove(&k);
+            }
+        }
+    }
 
     /// What the driver tells the worker each cycle: who's connected, and what we hold
     /// that we can't deliver locally.
@@ -1189,23 +1226,23 @@ mod handoff {
             let known_relays = known_relays.clone();
             let ev_tx = ev_tx.clone();
             std::thread::spawn(move || {
-                // Bundles already handed off (id → dest region), so we don't re-write them
-                // every cycle. Bounded reset keeps it from growing unboundedly.
-                let mut handed: HashSet<(BundleId, String)> = HashSet::new();
+                // Bundles already handed off (id → dest region), so we don't re-write them every
+                // cycle. services-r2-04: each dedup entry carries the bundle's own `expires_at`, so
+                // we evict by AGE (drop entries whose bundle has expired / been TTL-swept and thus
+                // can never be re-handed/re-spooled) instead of a wholesale clear(). A wholesale
+                // clear at the cap let an already-handed bundle be re-put/re-spooled on the next
+                // cycle (a periodic redundant-Firestore-write storm). Age eviction keeps memory
+                // bounded without the rewrite burst; a hard cap (evict nearest-to-expiry) remains a
+                // fallback so a pathological all-far-future set is still bounded.
+                let mut handed: HashMap<(BundleId, String), u64> = HashMap::new();
                 // §39 P5: private bundles already spooled to a mailbox (id → tag), and bundles
                 // already pulled back from a mailbox (id), so neither is redone every cycle.
-                let mut spooled: HashSet<(BundleId, Tag)> = HashSet::new();
-                let mut pulled: HashSet<BundleId> = HashSet::new();
+                let mut spooled: HashMap<(BundleId, Tag), u64> = HashMap::new();
+                let mut pulled: HashMap<BundleId, u64> = HashMap::new();
                 for snap in snap_rx {
-                    if handed.len() > 100_000 {
-                        handed.clear();
-                    }
-                    if spooled.len() > 100_000 {
-                        spooled.clear();
-                    }
-                    if pulled.len() > 100_000 {
-                        pulled.clear();
-                    }
+                    evict_expired(&mut handed, snap.now_ms);
+                    evict_expired(&mut spooled, snap.now_ms);
+                    evict_expired(&mut pulled, snap.now_ms);
                     // Record presence for connected device peers (skip peer relays).
                     for dev in &snap.devices {
                         let b58 = bs58::encode(dev).into_string();
@@ -1231,7 +1268,7 @@ mod handoff {
                         if dst_region == region {
                             continue; // already in our partition; we'll deliver on reconnect
                         }
-                        if !handed.insert((*id, dst_region.clone())) {
+                        if handed.insert((*id, dst_region.clone()), *expires).is_some() {
                             continue; // already written this cycle-set
                         }
                         let dest_node = region_node_b58(&base_seed, &dst_region);
@@ -1339,11 +1376,12 @@ mod handoff {
         store: &M,
         spool: &[(BundleId, Tag, Vec<u8>, u64)],
         wanted: &[Tag],
-        spooled: &mut HashSet<(BundleId, Tag)>,
-        pulled: &mut HashSet<BundleId>,
+        spooled: &mut HashMap<(BundleId, Tag), u64>,
+        pulled: &mut HashMap<BundleId, u64>,
     ) -> Vec<Vec<u8>> {
         for (id, tag, bytes, expires) in spool {
-            if !spooled.insert((*id, *tag)) {
+            // services-r2-04: dedup value is the bundle's own expiry, so the caller can age-evict.
+            if spooled.insert((*id, *tag), *expires).is_some() {
                 continue; // already spooled this cycle-set
             }
             let tag_b58 = bs58::encode(tag).into_string();
@@ -1375,12 +1413,12 @@ mod handoff {
                     continue;
                 }
             };
-            for (bytes, _expires) in held {
+            for (bytes, expires) in held {
                 let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
                     continue;
                 };
                 let id = b.id();
-                if pulled.insert(id) {
+                if pulled.insert(id, expires).is_none() {
                     // services-03: pull side of the spool/pull correlation; operator log only.
                     super::netlog_private(format!(
                         "want-beacon: pulled msg {} from mailbox {}",
@@ -1446,8 +1484,13 @@ mod handoff {
             seal_to: &PubKeyBytes,
         ) -> (BundleId, Tag, Vec<u8>) {
             use hop_core::bundle::{Bundle, BundleOpts, Payload};
-            // F-06: the mailbox tag is derived from the recipient address + epoch (epoch 0 here).
-            let mailbox = hop_core::crypto::mailbox_tag(seal_to, 0);
+            use hop_core::crypto::{
+                mailbox_route, mailbox_tag, MAILBOX_ROUTE_PREFIX_BYTES, TAG_LEN,
+            };
+            // F-06 / core-protocol-r2-02: the recipient's mailbox tag (address + epoch 0) is projected
+            // to its 2-byte ROUTING PREFIX; the private header now carries only that prefix (never the
+            // full tag), so the relay's spool key is an anonymity set, not a per-recipient address.
+            let route = mailbox_route(&mailbox_tag(seal_to, 0));
             let b = Bundle::create_private(
                 seal_to,
                 spk_pub,
@@ -1455,11 +1498,15 @@ mod handoff {
                     content_type: "t".into(),
                     body: b"cross-region".to_vec(),
                 },
-                Some(mailbox),
+                Some(route),
                 BundleOpts::default(),
             )
             .unwrap();
-            (b.id(), mailbox, b.to_bytes().unwrap())
+            // The relay spools/pulls under the route-key: the 2-byte prefix right-padded into a full
+            // Tag (matching the driver's spoolable_private_bundles / take_wanted_mailboxes keys).
+            let mut spool_key = [0u8; TAG_LEN];
+            spool_key[..MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(&route);
+            (b.id(), spool_key, b.to_bytes().unwrap())
         }
 
         #[test]
@@ -1471,7 +1518,7 @@ mod handoff {
             let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
 
             // Region A: no live gradient → spool the bundle. Its own dedup sets.
-            let (mut sp_a, mut pl_a) = (HashSet::new(), HashSet::new());
+            let (mut sp_a, mut pl_a) = (HashMap::new(), HashMap::new());
             let out_a = process_mailbox(
                 &store,
                 &[(id, tag, bytes.clone(), 0)],
@@ -1490,7 +1537,7 @@ mod handoff {
             );
 
             // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
-            let (mut sp_b, mut pl_b) = (HashSet::new(), HashSet::new());
+            let (mut sp_b, mut pl_b) = (HashMap::new(), HashMap::new());
             let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
             assert_eq!(
                 out_b.len(),
@@ -1513,7 +1560,7 @@ mod handoff {
                     .is_empty(),
                 "spool copy deleted after pull"
             );
-            let (mut sp_c, mut pl_c) = (HashSet::new(), HashSet::new());
+            let (mut sp_c, mut pl_c) = (HashMap::new(), HashMap::new());
             assert!(
                 process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
                 "no double-delivery on re-beacon"
@@ -1527,7 +1574,7 @@ mod handoff {
             let bob = Identity::generate();
             let spk = bob.derive_prekey();
             let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
-            let (mut sp, mut pl) = (HashSet::new(), HashSet::new());
+            let (mut sp, mut pl) = (HashMap::new(), HashMap::new());
             process_mailbox(&store, &[(id, tag, bytes, 0)], &[], &mut sp, &mut pl);
             // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
             let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
@@ -1639,5 +1686,112 @@ mod log_privacy_tests {
         );
         // Sanity: netlog is the public path (compiles + routes through emit).
         netlog("relay up: region=test");
+    }
+}
+
+#[cfg(test)]
+mod control_path_tests {
+    // services-r2-02: the newly-added robustness controls (frame cap + connection shedding) are the
+    // exact surface that keeps a degraded/attacked relay from exhausting threads or memory, yet had
+    // no direct tests. These exercise them so a regression fails a test, not CI.
+    use super::{admit_conn, frame_len_ok, MAX_CONNS, MAX_FRAME_BYTES};
+
+    #[test]
+    fn frame_cap_rejects_oversized_and_accepts_at_the_bound() {
+        // The WS path and the raw-TCP path must share the SAME 1 MiB bound (not tungstenite's 64 MiB
+        // default), so a single WS client can't push a frame the TCP path would have rejected.
+        assert!(frame_len_ok(0));
+        assert!(
+            frame_len_ok(MAX_FRAME_BYTES),
+            "exactly at the cap is accepted"
+        );
+        assert!(
+            !frame_len_ok(MAX_FRAME_BYTES + 1),
+            "one byte over the cap is rejected"
+        );
+        assert!(
+            !frame_len_ok(64 << 20),
+            "the old 64 MiB default is rejected"
+        );
+    }
+
+    #[test]
+    fn admit_conn_sheds_over_the_connection_cap() {
+        // Over MAX_CONNS, admit_conn returns None (the socket is shed) instead of spawning a handler
+        // thread; dropping a guard frees its slot so the next connection is admitted again. This test
+        // owns the process-global counter (no other threads run in a unit test), so it can fill it.
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let g = admit_conn().expect("under the cap is admitted");
+            guards.push(g);
+        }
+        // At the cap: the next admit is shed.
+        assert!(
+            admit_conn().is_none(),
+            "a connection over MAX_CONNS is shed, not spawned"
+        );
+        // Free one slot; the next admit succeeds again (the guard's Drop released it).
+        guards.pop();
+        let g = admit_conn().expect("a freed slot re-admits");
+        drop(g);
+        // Release everything so the global counter returns to zero for any later test.
+        guards.clear();
+        assert!(
+            admit_conn().is_some(),
+            "counter fully released after cleanup"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "firestore"))]
+mod handoff_dedup_tests {
+    // services-r2-04: age-based eviction of the handoff/spool dedup maps, replacing the wholesale
+    // clear() that let already-handed bundles be redundantly re-written to Firestore after a reset.
+    use super::handoff::evict_expired;
+    use std::collections::HashMap;
+
+    #[test]
+    fn evict_expired_drops_only_past_entries_and_keeps_live_ones() {
+        let now = 1_000_000u64;
+        let mut m: HashMap<u32, u64> = HashMap::new();
+        m.insert(1, now - 1); // expired
+        m.insert(2, now); // exactly now -> expired (not > now)
+        m.insert(3, now + 1); // still live
+        m.insert(4, 0); // never-expire sentinel -> kept
+        evict_expired(&mut m, now);
+        assert!(!m.contains_key(&1), "past entry dropped");
+        assert!(!m.contains_key(&2), "at-now entry dropped");
+        assert!(
+            m.contains_key(&3),
+            "future entry kept (still deduped, not re-written)"
+        );
+        assert!(m.contains_key(&4), "never-expire entry kept");
+    }
+
+    #[test]
+    fn evict_expired_bounds_a_pathological_all_future_set_without_a_wholesale_clear() {
+        // The old code did `if len > 100_000 { clear() }`, a full wipe that let every entry be
+        // redundantly re-put next cycle. Age eviction can't shrink an all-future set, so a hard cap
+        // fallback evicts the nearest-to-expiry surplus while KEEPING most entries deduped (no wipe).
+        let now = 1_000u64;
+        let cap = 100_000usize;
+        let mut m: HashMap<u64, u64> = HashMap::new();
+        // cap + 25 entries, all far in the future (so age eviction removes none of them).
+        for i in 0..(cap as u64 + 25) {
+            m.insert(i, now + 10_000_000 + i); // strictly increasing future expiries
+        }
+        evict_expired(&mut m, now);
+        assert_eq!(
+            m.len(),
+            cap,
+            "trimmed to exactly the cap, NOT wiped to empty like the old clear()"
+        );
+        // The nearest-to-expiry (smallest expiry = smallest i) were the victims; the far-future
+        // ones are retained, so most bundles stay deduped and are not redundantly re-written.
+        assert!(!m.contains_key(&0), "nearest-to-expiry evicted");
+        assert!(
+            m.contains_key(&(cap as u64 + 24)),
+            "far-future entry retained (still deduped)"
+        );
     }
 }
