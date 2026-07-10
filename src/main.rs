@@ -84,6 +84,12 @@ const HEALTHZ_STALE_MS: u64 = 30_000;
 /// Cloud Run reaps the instance isn't lost.
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// stores-09: a shared handle to the durable store's dropped-op counter (Firestore mirror backlog
+/// shedding under a degraded backend). `/healthz` reads it so a relay that is silently losing durable
+/// writes reports unhealthy instead of all-green. `None` for the sqlite/in-memory store (nothing is
+/// shed there). Set once at startup by `build_store`.
+static MIRROR_DROPPED: OnceLock<std::sync::Arc<AtomicU64>> = OnceLock::new();
+
 extern "C" fn on_sigterm(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
@@ -230,10 +236,20 @@ fn netlog_private(line: impl Into<String>) {
 fn serve_healthz(mut stream: TcpStream) {
     let last = LAST_TICK_MS.load(Ordering::Relaxed);
     let healthy = last != 0 && now_ms().saturating_sub(last) < HEALTHZ_STALE_MS;
-    let (status, body) = if healthy {
-        ("200 OK", "ok")
+    // stores-09: surface the durable store's dropped-op count. We do NOT flip to 503 on drops (a
+    // restart won't fix a Firestore outage and would drop the in-memory hot path too); we report it
+    // in the body so a monitor/operator sees the relay is not currently durable. Only a wedged
+    // driver (stale tick) is a restart-worthy 503.
+    let dropped = MIRROR_DROPPED
+        .get()
+        .map(|d| d.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let (status, body) = if !healthy {
+        ("503 Service Unavailable", "stale".to_string())
+    } else if dropped > 0 {
+        ("200 OK", format!("ok degraded: mirror_dropped={dropped}"))
     } else {
-        ("503 Service Unavailable", "stale")
+        ("200 OK", "ok".to_string())
     };
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -871,6 +887,9 @@ fn build_store(firestore: &Option<String>, db: &str, addr: &[u8]) -> Box<dyn Sto
         match FirestoreStore::open(project, addr) {
             Ok(s) => {
                 println!("store: firestore (project {project})");
+                // stores-09: expose the mirror's dropped-op counter to /healthz so a degraded
+                // Firestore (writes being shed under backpressure) surfaces as unhealthy.
+                let _ = MIRROR_DROPPED.set(s.mirror_dropped_handle());
                 return Box::new(s);
             }
             Err(e) => eprintln!("firestore open failed ({e}); falling back to sqlite"),
