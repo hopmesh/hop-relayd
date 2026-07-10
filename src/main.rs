@@ -58,26 +58,69 @@ fn frame_len_ok(n: usize) -> bool {
 /// services-04: cap concurrent inbound connections so the one-thread-per-connection accept loops
 /// can't be driven to thread/memory exhaustion on a single-instance region (the port endpoint's
 /// F-19 control, ported back to relayd). Over the cap we shed the socket rather than spawn.
+///
+/// services-r3-01: this budget is for MESH connections only (raw-TCP bearers and WS device/relay
+/// links). Idle public log-stream viewers get their own, much smaller budget ([`MAX_LOG_CONNS`]) so
+/// a flood of unauthenticated plain-HTTP viewers can NEVER camp the slots a mesh peer needs, and
+/// `/healthz` is exempt entirely (it answers immediately and closes). Admission therefore happens
+/// AFTER the peek-classification, not blindly at accept, so each connection charges the right pool.
 const MAX_CONNS: usize = 1_024;
 static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Decrements the active-connection count when a handler thread finishes (incl. panic unwind).
-struct ConnGuard;
+/// services-r3-01: a separate, deliberately small budget for public live-log viewers. These are
+/// idle, unauthenticated observers; they must not be able to exhaust the mesh budget. Even fully
+/// saturated, log viewers leave all [`MAX_CONNS`] mesh slots free. Combined with the per-viewer
+/// total deadline in `serve_log_stream`, a silent holder cannot camp even a log slot indefinitely.
+const MAX_LOG_CONNS: usize = 64;
+static ACTIVE_LOG_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A public log viewer holds a slot for at most this long, then the stream is closed. Bounds how
+/// long any single (even actively-draining) viewer can occupy one of the [`MAX_LOG_CONNS`] slots, so
+/// the small log pool keeps rotating and cannot be permanently pinned. Viewers just reconnect.
+const LOG_STREAM_MAX_MS: u64 = 10 * 60 * 1000; // 10 minutes
+
+/// The effective per-viewer deadline in ms. Normally [`LOG_STREAM_MAX_MS`]; a test seam
+/// (`HOP_LOG_STREAM_MAX_MS`) lets a test drive a short deadline and observe the stream close.
+fn log_stream_max_ms() -> u64 {
+    std::env::var("HOP_LOG_STREAM_MAX_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LOG_STREAM_MAX_MS)
+}
+
+/// Decrements a connection counter when a handler thread finishes (incl. panic unwind). The pointer
+/// identifies which pool (`ACTIVE_CONNS` or `ACTIVE_LOG_CONNS`) this guard charged.
+struct ConnGuard(&'static std::sync::atomic::AtomicUsize);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// Admit an inbound connection if we're under [`MAX_CONNS`], returning a guard that releases the
-/// slot on drop. `None` ⇒ over the cap, shed the connection. (services-04)
-fn admit_conn() -> Option<ConnGuard> {
-    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
-        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+/// Admit against a given counter/cap, returning a guard that releases the slot on drop. `None` ⇒
+/// over the cap, shed the connection.
+fn admit_against(
+    counter: &'static std::sync::atomic::AtomicUsize,
+    cap: usize,
+) -> Option<ConnGuard> {
+    if counter.fetch_add(1, Ordering::SeqCst) >= cap {
+        counter.fetch_sub(1, Ordering::SeqCst);
         None
     } else {
-        Some(ConnGuard)
+        Some(ConnGuard(counter))
     }
+}
+
+/// Admit a MESH connection (raw-TCP bearer or WS device/relay link) against [`MAX_CONNS`].
+/// `None` ⇒ over the mesh cap, shed. (services-04, services-r3-01)
+fn admit_conn() -> Option<ConnGuard> {
+    admit_against(&ACTIVE_CONNS, MAX_CONNS)
+}
+
+/// Admit a public log-stream viewer against the separate [`MAX_LOG_CONNS`] budget so viewers can
+/// never consume a mesh slot. `None` ⇒ over the log cap, shed. (services-r3-01)
+fn admit_log_conn() -> Option<ConnGuard> {
+    admit_against(&ACTIVE_LOG_CONNS, MAX_LOG_CONNS)
 }
 
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
@@ -270,7 +313,12 @@ fn serve_healthz(mut stream: TcpStream) {
 /// Stream the live network log to a plain-HTTP visitor (text/plain, incremental). Leads
 /// with this node's identity so a visitor to the anycast name sees which region answered.
 fn serve_log_stream(mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(None);
+    // services-r3-01: a public log viewer holds one of the small [`MAX_LOG_CONNS`] slots. Bound how
+    // long it can hold it with a total deadline, and use a write timeout so a stalled reader (a slow
+    // or wedged TCP peer that never drains) cannot block this thread forever on `write_all`. Together
+    // these guarantee the log pool keeps rotating and a silent/slow holder cannot pin a slot.
+    let deadline = std::time::Instant::now() + Duration::from_millis(log_stream_max_ms());
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let (who, backlog, rx) = log_hub().subscribe();
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
                   Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -311,7 +359,14 @@ fn serve_log_stream(mut stream: TcpStream) {
     // A viewer connecting is itself only logged privately (it is an observer, not network traffic).
     netlog_private("http: log viewer connected");
     loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
+        // services-r3-01: enforce the total-connection deadline so no viewer can pin a log slot
+        // beyond LOG_STREAM_MAX_MS. Wake at least every 15s to emit a keepalive `: ping`.
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = (deadline - now).min(Duration::from_secs(15));
+        match rx.recv_timeout(wait) {
             Ok(line) => {
                 if stream.write_all(format!("{line}\n").as_bytes()).is_err()
                     || stream.flush().is_err()
@@ -456,15 +511,45 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-04: shed over the connection cap rather than spawn unboundedly.
-                let Some(guard) = admit_conn() else {
-                    drop(stream);
-                    continue;
+                // services-r3-01: classify the request (WS upgrade / healthz / log-stream) via a
+                // non-consuming peek BEFORE charging any budget, then admit against the RIGHT pool so
+                // idle log viewers can never starve mesh links. Only the peek itself is done inline
+                // (bounded, cheap); the long-lived handler runs on its own thread. Peek failures /
+                // over-budget shed the socket without spawning, keeping thread spawn bounded.
+                let kind = classify_ws_peek(&stream);
+                let guard = match kind {
+                    // Healthz answers immediately and closes: exempt from every budget so a real
+                    // liveness probe is NEVER shed at the cap (services-r3-04). No slot charged.
+                    WsKind::Healthz => {
+                        std::thread::spawn(move || serve_healthz(stream));
+                        continue;
+                    }
+                    // Log viewers charge their own small budget; over it, shed.
+                    WsKind::LogStream => match admit_log_conn() {
+                        Some(g) => g,
+                        None => {
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                    // Real WS upgrade: a mesh link, charges the mesh budget; over it, shed.
+                    WsKind::Upgrade => match admit_conn() {
+                        Some(g) => g,
+                        None => {
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                    // No data / empty probe: nothing to serve, no thread, no slot.
+                    WsKind::Empty => {
+                        drop(stream);
+                        continue;
+                    }
                 };
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     let _guard = guard;
-                    serve_ws(stream, &tx)
+                    serve_ws(stream, kind, &tx)
                 });
             }
         });
@@ -730,34 +815,65 @@ fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
 /// Drive one WebSocket connection: one thread both reads binary frames and, on a
 /// short read timeout, drains the outgoing channel. The LB terminates TLS, so this
 /// is plain `ws://`; each link packet is one binary frame (no extra framing).
-fn serve_ws(stream: TcpStream, ev_tx: &Sender<Ev>) {
+/// The three request shapes the WS front door serves, decided by a non-consuming peek so each can
+/// charge the correct connection budget (services-r3-01). `Empty` = no data / a probe with no
+/// payload (nothing to serve).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WsKind {
+    Healthz,
+    LogStream,
+    Upgrade,
+    Empty,
+}
+
+/// Classify an inbound $PORT request without consuming any bytes, so the accept loop can pick the
+/// right budget BEFORE spawning a handler. Cloud Run sends plain HTTP (connectivity checks, health
+/// probes, any non-WS GET); a real WebSocket upgrade is a mesh link. A non-consuming `peek` leaves
+/// the bytes in the socket buffer for `serve_healthz` / `serve_log_stream` / tungstenite to re-read.
+fn classify_ws_peek(stream: &TcpStream) -> WsKind {
     let _ = stream.set_nodelay(true);
-    // Cloud Run sends plain HTTP requests to $PORT (connectivity checks, health probes,
-    // any non-WS GET). If we just close those, Cloud Run sees a malformed/empty response
-    // and recycles the instance in a loop — starving real WS clients (503s). So peek the
-    // request first; anything that isn't a WebSocket upgrade gets the live network-log
-    // stream (a valid 200, so the instance stays healthy). A non-consuming peek leaves the
-    // bytes for tungstenite.
-    {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut head = [0u8; 1024];
-        match stream.peek(&mut head) {
-            Ok(n) if n > 0 => {
-                let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
-                // F-17: a real health probe, tied to the driver loop's heartbeat — distinct from the
-                // log stream, which stays up even if the driver deadlocks and so is NOT a health signal.
-                if req.contains("get /healthz") {
-                    serve_healthz(stream);
-                    return;
-                }
-                if !req.contains("upgrade: websocket") {
-                    serve_log_stream(stream);
-                    return;
-                }
+    // A short read timeout bounds how long a stalled/slowloris client can hold the accept thread on
+    // the peek; on timeout the peek returns an error and we treat it as Empty (shed, no slot).
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut head = [0u8; 1024];
+    let kind = match stream.peek(&mut head) {
+        Ok(n) if n > 0 => {
+            let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+            // F-17: a real health probe, tied to the driver loop's heartbeat — distinct from the log
+            // stream, which stays up even if the driver deadlocks and so is NOT a health signal.
+            if req.contains("get /healthz") {
+                WsKind::Healthz
+            } else if req.contains("upgrade: websocket") {
+                WsKind::Upgrade
+            } else {
+                WsKind::LogStream
             }
-            _ => return, // no data / probe with no payload — nothing to serve
         }
-        let _ = stream.set_read_timeout(None); // hand a clean blocking socket to tungstenite
+        _ => WsKind::Empty, // no data / probe with no payload — nothing to serve
+    };
+    // Restore the blocking socket the handlers expect (tungstenite reads without a read timeout).
+    if kind == WsKind::Upgrade {
+        let _ = stream.set_read_timeout(None);
+    }
+    kind
+}
+
+fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
+    // The accept loop already peek-classified this connection and charged the right budget
+    // (services-r3-01). Dispatch non-mesh shapes to their handlers; only a real upgrade continues
+    // into the WS driver below. If we just closed non-WS GETs, Cloud Run would see a malformed/empty
+    // response and recycle the instance in a loop, so a plain GET gets the live log stream instead.
+    match kind {
+        WsKind::Healthz => {
+            serve_healthz(stream);
+            return;
+        }
+        WsKind::LogStream => {
+            serve_log_stream(stream);
+            return;
+        }
+        WsKind::Empty => return,
+        WsKind::Upgrade => {}
     }
     // services-05: cap the WS message/frame size to match the raw-TCP bearer path, instead of
     // tungstenite's 64 MiB default, so neither transport accepts an oversized message.
@@ -1694,7 +1810,14 @@ mod control_path_tests {
     // services-r2-02: the newly-added robustness controls (frame cap + connection shedding) are the
     // exact surface that keeps a degraded/attacked relay from exhausting threads or memory, yet had
     // no direct tests. These exercise them so a regression fails a test, not CI.
-    use super::{admit_conn, frame_len_ok, MAX_CONNS, MAX_FRAME_BYTES};
+    use super::{
+        admit_conn, admit_log_conn, frame_len_ok, MAX_CONNS, MAX_FRAME_BYTES, MAX_LOG_CONNS,
+    };
+    use std::sync::Mutex;
+
+    // These tests all mutate the process-global connection counters, so they must not run
+    // concurrently with each other. Serialize them on one lock (Rust runs test fns in parallel).
+    static CONN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn frame_cap_rejects_oversized_and_accepts_at_the_bound() {
@@ -1717,9 +1840,9 @@ mod control_path_tests {
 
     #[test]
     fn admit_conn_sheds_over_the_connection_cap() {
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
         // Over MAX_CONNS, admit_conn returns None (the socket is shed) instead of spawning a handler
-        // thread; dropping a guard frees its slot so the next connection is admitted again. This test
-        // owns the process-global counter (no other threads run in a unit test), so it can fill it.
+        // thread; dropping a guard frees its slot so the next connection is admitted again.
         let mut guards = Vec::new();
         for _ in 0..MAX_CONNS {
             let g = admit_conn().expect("under the cap is admitted");
@@ -1741,6 +1864,161 @@ mod control_path_tests {
             "counter fully released after cleanup"
         );
     }
+
+    #[test]
+    fn log_viewers_cannot_starve_a_mesh_connection() {
+        // services-r3-01 (HIGH regression): the core proof. Fill EVERY log-stream slot with idle
+        // viewers, then over-fill (extra viewers are shed on their own budget). A mesh connection
+        // (WS device/relay link) must STILL be admitted, because log viewers charge a separate pool
+        // and can never touch the mesh budget. Before the fix, both shared MAX_CONNS, so N idle
+        // viewers filled the pool and this admit_conn() would have returned None (starvation).
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let mut log_guards = Vec::new();
+        for _ in 0..MAX_LOG_CONNS {
+            log_guards.push(admit_log_conn().expect("log viewer admitted under the log cap"));
+        }
+        // The log pool is now full: extra viewers are shed (their own budget, not the mesh budget).
+        assert!(
+            admit_log_conn().is_none(),
+            "log viewers are capped by their OWN small budget, not the mesh budget"
+        );
+        // The whole point: a mesh link is admitted regardless of how many log viewers are camped.
+        let mesh = admit_conn().expect(
+            "a mesh connection MUST be admitted even with every log-stream slot occupied \
+             (log viewers must never starve mesh traffic)",
+        );
+        drop(mesh);
+        log_guards.clear();
+        // Symmetric: a full mesh budget must not shed a log viewer either (no reverse starvation).
+        let mut mesh_guards = Vec::new();
+        for _ in 0..MAX_CONNS {
+            mesh_guards.push(admit_conn().expect("mesh link admitted under the mesh cap"));
+        }
+        assert!(admit_conn().is_none(), "mesh budget is full");
+        assert!(
+            admit_log_conn().is_some(),
+            "a log viewer is still admitted when the mesh budget is full (separate pools)"
+        );
+        mesh_guards.clear();
+    }
+
+    #[test]
+    fn log_stream_closes_at_the_total_deadline() {
+        // services-r3-01: a viewer that never disconnects must NOT camp its slot forever. With a
+        // short deadline (test seam), serve_log_stream emits its header/note then closes the socket
+        // when LOG_STREAM_MAX_MS elapses, so the reader observes EOF (read returns 0). Before the
+        // fix, serve_log_stream looped forever with no total deadline.
+        use super::serve_log_stream;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        std::env::set_var("HOP_LOG_STREAM_MAX_MS", "300");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_log_stream(sock); // returns only when the deadline closes the stream
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        // Read until EOF; the server must close within ~the deadline (not hang forever).
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 4096];
+        let mut saw_header = false;
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break, // EOF: server closed at the deadline
+                Ok(n) => {
+                    if String::from_utf8_lossy(&buf[..n]).contains("hop relay") {
+                        saw_header = true;
+                    }
+                }
+                // The server dropping the socket with unread buffered bytes surfaces as an
+                // RST (ConnectionReset) rather than a clean EOF on some platforms. Either way the
+                // connection is CLOSED at the deadline, which is exactly what we assert.
+                Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(e) => panic!("read failed unexpectedly: {e}"),
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(4),
+                "log stream did not close at its deadline (would camp a slot forever)"
+            );
+        }
+        // The core proof is the timely close above; the header is best-effort (an RST can drop
+        // buffered bytes before the client drains them, but the connection still closed on time).
+        let _ = saw_header;
+        server.join().unwrap();
+        std::env::remove_var("HOP_LOG_STREAM_MAX_MS");
+    }
+
+    #[test]
+    fn peek_classifies_healthz_log_and_upgrade_so_each_charges_the_right_budget() {
+        // services-r3-01 / services-r3-04: the peek routes /healthz, a plain GET, and a WS upgrade
+        // distinctly. Healthz must be classified as Healthz (the accept loop then serves it with NO
+        // slot charged, so a liveness probe is never shed at the cap); a plain GET => LogStream
+        // (charges the small log budget); a real upgrade => Upgrade (charges the mesh budget).
+        use super::{classify_ws_peek, WsKind};
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        fn classify(req: &[u8]) -> WsKind {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let req = req.to_vec();
+            let h = std::thread::spawn(move || {
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.write_all(&req).unwrap();
+                // Hold the socket open until classification has peeked.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            });
+            let (sock, _) = listener.accept().unwrap();
+            // Give the client a moment to send before we peek.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let kind = classify_ws_peek(&sock);
+            h.join().unwrap();
+            kind
+        }
+
+        assert_eq!(
+            classify(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"),
+            WsKind::Healthz,
+            "healthz probe is classified as Healthz (served with NO slot charged)"
+        );
+        assert_eq!(
+            classify(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            WsKind::LogStream,
+            "a plain non-upgrade GET is a log viewer (charges the small log budget)"
+        );
+        assert_eq!(
+            classify(
+                b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+            WsKind::Upgrade,
+            "a real WS upgrade is a mesh link (charges the mesh budget)"
+        );
+    }
+
+    // The log budget must be a small reserve, strictly smaller than the mesh budget, so even a
+    // fully-saturated log pool is a bounded, negligible resource cost and can never dominate; and at
+    // least one viewer can still watch. These are compile-time invariants of the two constants, so a
+    // const assertion enforces them at BUILD time (stronger than a runtime test, and it cannot drift).
+    const _: () = assert!(
+        MAX_LOG_CONNS < MAX_CONNS,
+        "log viewers get a strictly smaller budget than mesh links"
+    );
+    const _: () = assert!(
+        MAX_LOG_CONNS >= 1,
+        "at least one viewer can still watch the log"
+    );
 }
 
 #[cfg(all(test, feature = "firestore"))]
@@ -1792,6 +2070,416 @@ mod handoff_dedup_tests {
         assert!(
             m.contains_key(&(cap as u64 + 24)),
             "far-future entry retained (still deduped)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::*;
+
+    #[test]
+    fn host_of_extracts_the_identify_name_from_a_ws_url() {
+        // §29: a relay's identify name is the host of its --advertise URL, so a trace shows the
+        // relay by domain. Strip the ws/wss scheme and any path; a bare host is passed through.
+        assert_eq!(
+            host_of("wss://us-central1.relay.hopme.sh/"),
+            "us-central1.relay.hopme.sh"
+        );
+        assert_eq!(
+            host_of("ws://eu.relay.hopme.sh:8080/x"),
+            "eu.relay.hopme.sh:8080"
+        );
+        assert_eq!(host_of("wss://plainhost"), "plainhost");
+        assert_eq!(
+            host_of("relay.example.com/path"),
+            "relay.example.com",
+            "no scheme: still strips the path"
+        );
+        assert_eq!(host_of("bare"), "bare");
+    }
+
+    #[test]
+    fn hms_formats_utc_hms_and_wraps_at_a_day() {
+        // The live-log timestamp is UTC HH:MM:SS derived from epoch ms; it must wrap the hour at 24.
+        assert_eq!(hms(0), "00:00:00");
+        assert_eq!(hms(1_000), "00:00:01");
+        assert_eq!(hms(61_000), "00:01:01");
+        assert_eq!(hms(3_661_000), "01:01:01");
+        // 25h past the epoch wraps back to 01:00:00 (hour mod 24), proving the wrap, not a raw count.
+        assert_eq!(hms(25 * 3_600_000), "01:00:00");
+        // Sub-second ms are floored, not rounded up.
+        assert_eq!(hms(1_999), "00:00:01");
+    }
+
+    #[test]
+    fn region_seed_is_deterministic_distinct_per_region_and_bound_to_the_base() {
+        // §27/§28: every node derives a region's backbone seed the same way from the shared base +
+        // region name, so any node can address any region WITHOUT a per-region secret. The
+        // derivation must be deterministic (same inputs => same seed), distinct per region, and
+        // change if the base seed changes (so two different fleets never collide).
+        let base = [3u8; 32];
+        let a = region_seed(&base, "us-central1");
+        let a2 = region_seed(&base, "us-central1");
+        let b = region_seed(&base, "europe-west1");
+        assert_eq!(
+            a, a2,
+            "same base+region => identical seed (any node computes it)"
+        );
+        assert_ne!(a, b, "different regions get distinct seeds");
+        // A different base seed yields a different region seed (fleet isolation).
+        let other_base = [4u8; 32];
+        assert_ne!(
+            region_seed(&other_base, "us-central1"),
+            a,
+            "the region seed is bound to the base seed"
+        );
+        // It is not a trivial passthrough of the base.
+        assert_ne!(a, base, "the seed is a hash, not the base itself");
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn region_node_b58_matches_the_identity_derived_from_the_region_seed() {
+        // The handoff addresses a region's partition by the base58 of the node derived from that
+        // region's seed. It must equal the address you'd get by deriving the Identity directly, or a
+        // handoff would be written to the wrong partition and silently lost.
+        let base = [5u8; 32];
+        let region = "asia-east1";
+        let got = region_node_b58(&base, region);
+        let expected =
+            bs58::encode(Identity::from_secret_bytes(&region_seed(&base, region)).address())
+                .into_string();
+        assert_eq!(
+            got, expected,
+            "region_node_b58 == b58(address(region_seed))"
+        );
+        // Different regions map to different partition nodes (no cross-region aliasing).
+        assert_ne!(
+            region_node_b58(&base, "asia-east1"),
+            region_node_b58(&base, "asia-south1")
+        );
+    }
+
+    #[test]
+    fn short_b58_is_a_ten_char_prefix() {
+        // Compact log lines use a 10-char base58 prefix of an address; it must be a true prefix of
+        // the full encoding, capped at 10 chars.
+        let addr = [42u8; 32];
+        let full = bs58::encode(addr).into_string();
+        let short = short_b58(&addr);
+        assert!(short.len() <= 10);
+        assert_eq!(
+            short.len(),
+            10,
+            "a 32-byte address b58 is well over 10 chars"
+        );
+        assert!(
+            full.starts_with(&short),
+            "the short form is a prefix of the full"
+        );
+    }
+
+    #[test]
+    fn public_log_stream_flag_reads_the_env() {
+        // services-03: the public per-event stream is opt-in via HOP_PUBLIC_LOG_STREAM; only the
+        // truthy values enable it, everything else (incl. unset) leaves it off.
+        for v in ["1", "true", "yes"] {
+            std::env::set_var("HOP_PUBLIC_LOG_STREAM", v);
+            assert!(public_log_stream_enabled(), "{v} enables the public stream");
+        }
+        for v in ["0", "false", "no", "", "garbage"] {
+            std::env::set_var("HOP_PUBLIC_LOG_STREAM", v);
+            assert!(!public_log_stream_enabled(), "{v:?} leaves it off");
+        }
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        assert!(!public_log_stream_enabled(), "unset => off (safe default)");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        format!(
+            "{}/hop-relayd-id-{name}-{}-{}.key",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            NEXT_LINK.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn load_identity_from_a_valid_32_byte_file_is_deterministic() {
+        // A mounted 32-byte secret (--identity-file) must derive the SAME address every time, so the
+        // relay's address is stable across restarts (peers keep reaching it). Two loads of the same
+        // seed file yield the same address; a different seed yields a different one.
+        let path = tmp("valid");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        let a = load_identity(&Some(path.clone()), "unused.key").address();
+        let b = load_identity(&Some(path.clone()), "unused.key").address();
+        assert_eq!(a, b, "same seed file => same address across loads");
+        assert_eq!(
+            a,
+            Identity::from_secret_bytes(&[7u8; 32]).address(),
+            "the address is derived from the exact seed bytes"
+        );
+        std::fs::write(&path, [8u8; 32]).unwrap();
+        let c = load_identity(&Some(path.clone()), "unused.key").address();
+        assert_ne!(a, c, "a different seed file => a different address");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_identity_panics_on_a_wrong_sized_identity_file() {
+        // A misconfigured secret (not exactly 32 bytes) must FAIL LOUDLY (panic) rather than silently
+        // generate a throwaway identity, which would give the relay a wrong/unstable address.
+        let path = tmp("short");
+        std::fs::write(&path, [1u8; 16]).unwrap(); // 16 bytes, not 32
+        let r = std::panic::catch_unwind(|| load_identity(&Some(path.clone()), "unused.key"));
+        assert!(
+            r.is_err(),
+            "a wrong-sized --identity-file must panic, not fall back"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_identity_generates_and_persists_when_no_key_exists_then_reloads_it() {
+        // First run (no --identity-file, key_path missing): generate a fresh identity and PERSIST it,
+        // so the SECOND run loads the same seed and keeps the same address (stable across restarts).
+        let key = tmp("persist");
+        let _ = std::fs::remove_file(&key);
+        let first = load_identity(&None, &key).address();
+        assert!(
+            std::fs::metadata(&key).is_ok(),
+            "the seed was persisted to key_path"
+        );
+        let second = load_identity(&None, &key).address();
+        assert_eq!(
+            first, second,
+            "the persisted seed is reloaded => stable address across restarts"
+        );
+        let _ = std::fs::remove_file(&key);
+    }
+}
+
+#[cfg(test)]
+mod healthz_tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    // serve_healthz reads the process-global LAST_TICK_MS; serialize so tests don't race the value.
+    // Recover from poisoning so a single failing assertion reports ITS failure rather than
+    // cascading a PoisonError across the other healthz tests (which would obscure the real break).
+    static HEALTHZ_LOCK: Mutex<()> = Mutex::new(());
+    fn lock_healthz() -> std::sync::MutexGuard<'static, ()> {
+        HEALTHZ_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drive serve_healthz over a real loopback socket and return the raw HTTP response.
+    fn drive_healthz() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_healthz(sock);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).ok();
+        server.join().unwrap();
+        resp
+    }
+
+    #[test]
+    fn healthz_is_503_before_the_first_tick() {
+        // F-17: before the driver has ticked once (LAST_TICK_MS == 0) the instance is not yet live,
+        // so /healthz reports 503 stale — Cloud Run must NOT route traffic to a not-yet-started node.
+        let _lock = lock_healthz();
+        LAST_TICK_MS.store(0, Ordering::Relaxed);
+        let resp = drive_healthz();
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "no tick yet => 503: {resp}"
+        );
+        assert!(resp.trim_end().ends_with("stale"));
+    }
+
+    #[test]
+    fn healthz_is_200_when_the_driver_ticked_recently() {
+        // F-17: a fresh tick within HEALTHZ_STALE_MS => 200 ok, so a healthy instance keeps serving.
+        let _lock = lock_healthz();
+        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+        let resp = drive_healthz();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "recent tick => 200: {resp}"
+        );
+        assert!(resp.trim_end().ends_with("ok"));
+    }
+
+    #[test]
+    fn healthz_goes_503_when_the_tick_is_stale() {
+        // F-17 (the core proof): a wedged driver stops advancing LAST_TICK_MS. Once the last tick is
+        // older than HEALTHZ_STALE_MS, /healthz flips to 503 so Cloud Run restarts the wedged
+        // instance instead of the default TCP probe passing forever (a wedged instance IS the region).
+        let _lock = lock_healthz();
+        let stale = now_ms().saturating_sub(HEALTHZ_STALE_MS + 5_000);
+        LAST_TICK_MS.store(stale, Ordering::Relaxed);
+        let resp = drive_healthz();
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "a tick older than the stale window => 503 (restart the wedged instance): {resp}"
+        );
+        // Restore a fresh tick so a later concurrent/ordered test isn't surprised.
+        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tcp_framing_tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    /// serve_tcp reads 4-byte big-endian length-prefixed frames off the socket and pushes each
+    /// payload to the driver as an Ev::Data. This stands up a real loopback socket, feeds it framed
+    /// packets, and asserts the driver channel receives EXACTLY those payloads in order — the wire
+    /// contract path A relies on. An oversized length prefix (over MAX_FRAME_BYTES) must drop the
+    /// connection (Down) without ever emitting a giant Data.
+    fn run_serve_tcp(client_writes: impl FnOnce(&mut TcpStream) + Send + 'static) -> Vec<Ev> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_tcp(sock, Role::Responder, &ev_tx);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client_writes(&mut client);
+        // Half-close so serve_tcp's read loop hits EOF and returns, emitting Ev::Down.
+        client.shutdown(std::net::Shutdown::Write).ok();
+        // Drain the (finite) events until the server thread finishes and the channel closes.
+        let mut evs = Vec::new();
+        server.join().unwrap();
+        while let Ok(ev) = ev_rx.try_recv() {
+            evs.push(ev);
+        }
+        evs
+    }
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn serve_tcp_delivers_length_framed_payloads_in_order() {
+        // The raw-TCP bearer frames each link packet with a 4-byte BE length. serve_tcp must decode
+        // back the EXACT payloads, in order — a regression in the framing would corrupt every packet.
+        let evs = run_serve_tcp(|c| {
+            c.write_all(&framed(b"hello")).unwrap();
+            c.write_all(&framed(b"world!!")).unwrap();
+            c.flush().unwrap();
+        });
+        // Expect: Up, Data(hello), Data(world!!), Down.
+        let datas: Vec<Vec<u8>> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Data(_, b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            datas,
+            vec![b"hello".to_vec(), b"world!!".to_vec()],
+            "payloads decoded exactly and in order"
+        );
+        assert!(
+            matches!(evs.first(), Some(Ev::Up(_, Role::Responder, _))),
+            "first event is link-up as Responder"
+        );
+        assert!(
+            matches!(evs.last(), Some(Ev::Down(_))),
+            "clean EOF ends with link-down"
+        );
+    }
+
+    #[test]
+    fn serve_ws_dispatches_healthz_to_the_health_handler() {
+        // serve_ws is the WS front-door handler: the accept loop peek-classifies, then serve_ws
+        // dispatches. A Healthz kind must be answered by serve_healthz (a plain HTTP response), NOT
+        // fed into the WS driver — so a health probe on the $PORT front door works without a WS
+        // upgrade. Drive serve_ws(kind=Healthz) directly and assert an HTTP status line comes back.
+        // (Do NOT touch LAST_TICK_MS here — that global is owned by the serialized healthz_tests; we
+        // only assert that SOME health HTTP response is produced, whatever the current tick state.)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, _ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_ws(sock, WsKind::Healthz, &ev_tx);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).ok();
+        server.join().unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.1 503"),
+            "serve_ws(Healthz) answers with the health handler's HTTP response, not a WS upgrade: {resp}"
+        );
+    }
+
+    #[test]
+    fn serve_ws_empty_kind_serves_nothing() {
+        // A WsKind::Empty (a bare probe with no payload) is a no-op: serve_ws must return immediately
+        // without spawning a WS session or writing anything, so a connectivity probe can't wedge a
+        // handler. The driver channel receives NO Up event for an Empty connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_ws(sock, WsKind::Empty, &ev_tx);
+        });
+        let _client = TcpStream::connect(addr).unwrap();
+        server.join().unwrap();
+        assert!(
+            ev_rx.try_recv().is_err(),
+            "an Empty connection produces no driver event (no link is opened)"
+        );
+    }
+
+    #[test]
+    fn serve_tcp_drops_a_frame_over_the_size_cap_without_emitting_it() {
+        // services-05: an oversized length prefix (> MAX_FRAME_BYTES) must drop the connection rather
+        // than allocate/read a giant buffer — the DoS backstop. No Data is emitted for the bad frame;
+        // the loop breaks and the link goes Down. We send a length just over the cap and then bytes.
+        let evs = run_serve_tcp(|c| {
+            let bad_len = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+            c.write_all(&bad_len).unwrap();
+            // A little data after the bad prefix; serve_tcp must NOT read/emit it as a frame.
+            c.write_all(b"junk").unwrap();
+            c.flush().unwrap();
+        });
+        assert!(
+            !evs.iter().any(|e| matches!(e, Ev::Data(..))),
+            "an over-cap frame is never delivered as Data"
+        );
+        assert!(
+            matches!(evs.last(), Some(Ev::Down(_))),
+            "the connection is dropped (link-down) on an over-cap frame"
         );
     }
 }
