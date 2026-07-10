@@ -123,6 +123,24 @@ fn admit_log_conn() -> Option<ConnGuard> {
     admit_against(&ACTIVE_LOG_CONNS, MAX_LOG_CONNS)
 }
 
+/// services-r5-01: connections still in the peek-classification phase, before they charge their
+/// real pool. The accept-loop spawn is gated on THIS budget, not the mesh budget, so an inbound WS
+/// never charges (and so can never be shed at) the mesh cap before we know its kind. That keeps the
+/// two live-path regressions of the r3-02 refactor from happening: `/healthz` is no longer gated by
+/// a full mesh (it would organically fail the Cloud Run check once MAX_CONNS real links attach), and
+/// a slowloris camps only a cheap pending slot instead of a mesh slot. Sized well above [`MAX_CONNS`]
+/// so an organic full-mesh reconnect plus health/log probes never sheds here; peek threads are
+/// I/O-blocked (cheap) and bounded by the peek read timeout, so pending slots rotate quickly. A flood
+/// large enough to fill this budget is an active attacker, not organic load.
+const MAX_WS_PENDING: usize = 2_048;
+static ACTIVE_WS_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Admit a connection into the peek-classification phase against [`MAX_WS_PENDING`]. `None` ⇒ too
+/// many connections mid-classification, shed without spawning (keeps thread spawn bounded).
+fn admit_ws_pending() -> Option<ConnGuard> {
+    admit_against(&ACTIVE_WS_PENDING, MAX_WS_PENDING)
+}
+
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
 /// stops advancing, so Cloud Run restarts a wedged instance instead of the default TCP check passing
 /// forever (with one instance per region, a wedged instance IS the region). `0` = not started yet.
@@ -517,21 +535,21 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-r3-02: the peek+classify MUST NOT run on this accept thread. It has a
-                // multi-second read timeout, so one silent slowloris (connect, send nothing) would
-                // serially stall EVERY new accept here (mesh links, log viewers, healthz probes)
-                // behind its peek. So we admit a provisional mesh slot up front (this is the ceiling
-                // that keeps thread spawn bounded, since any inbound could be a mesh link) and spawn
-                // immediately; the peek/classify then runs on the WORKER thread, where a slowloris
-                // only stalls its own connection. The worker reconciles to the correct pool once it
-                // knows the kind (release + re-admit against the log budget, or release for
-                // healthz/empty), so per-pool accounting stays exactly as before.
-                let Some(guard) = admit_conn() else {
-                    drop(stream); // over the mesh cap: shed without spawning (bounded spawn)
+                // services-r3-02 / r5-01: the peek+classify MUST NOT run on this accept thread. It
+                // has a multi-second read timeout, so one silent slowloris (connect, send nothing)
+                // would serially stall EVERY new accept here (mesh links, log viewers, healthz
+                // probes) behind its peek. So we admit against the PENDING-peek budget (NOT the mesh
+                // budget) and spawn immediately; the peek/classify then runs on the WORKER thread,
+                // where a slowloris only stalls its own connection. Gating on the pending budget
+                // rather than a provisional mesh slot is what keeps `/healthz` and mesh links from
+                // being shed at the mesh cap before their kind is even known; the worker charges the
+                // real pool (mesh/log) only AFTER classification.
+                let Some(pending) = admit_ws_pending() else {
+                    drop(stream); // too many connections mid-classification: shed (bounded spawn)
                     continue;
                 };
                 let tx = tx.clone();
-                std::thread::spawn(move || admit_and_serve_ws(stream, guard, &tx));
+                std::thread::spawn(move || admit_and_serve_ws(stream, pending, &tx));
             }
         });
     }
@@ -839,40 +857,39 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
     kind
 }
 
-/// services-r3-02: runs on the spawned worker thread (NOT the accept loop). Peek-classifies the
-/// connection (the slow, timeout-bounded step, now off the accept path so a slowloris can't stall
-/// new accepts), reconciles the provisional mesh slot `guard` to the correct pool, then serves.
-///
-/// The caller already charged one MESH slot (`guard`) so thread spawn is bounded by the mesh cap.
-/// Here we fix up the accounting once the real kind is known, keeping per-pool budgets identical to
-/// the old inline classify:
-///   * `Healthz`  : exempt from every budget. Release the mesh slot and serve (never shed at the cap).
-///   * `LogStream`: charges the SMALL log budget, not mesh. Release the mesh slot; admit a log slot;
-///     if the log pool is full, shed (no mesh slot held, so log viewers can't camp mesh).
-///   * `Upgrade`  : a real mesh link. KEEP the mesh slot and serve.
-///   * `Empty`    : nothing to serve. Release the mesh slot and drop.
-fn admit_and_serve_ws(stream: TcpStream, guard: ConnGuard, ev_tx: &Sender<Ev>) {
+/// services-r3-02 / r5-01: runs on the spawned worker thread (NOT the accept loop). Peek-classifies
+/// the connection (the slow, timeout-bounded step, off the accept path so a slowloris can't stall
+/// new accepts), then charges the REAL pool once the kind is known and serves. The caller charged a
+/// pending-peek slot (`pending`); we release it as soon as classification finishes and admit against
+/// the actual budget, so the mesh cap is only ever charged by a real mesh link (not by healthz, a log
+/// viewer, or an unclassified slowloris):
+///   * `Healthz`  : exempt from every budget. Serve immediately (never shed at any cap).
+///   * `LogStream`: charges the SMALL log budget only; if the log pool is full, shed.
+///   * `Upgrade`  : a real mesh link. Charge the mesh budget now; if the mesh cap is full, shed.
+///   * `Empty`    : nothing to serve. Drop.
+fn admit_and_serve_ws(stream: TcpStream, pending: ConnGuard, ev_tx: &Sender<Ev>) {
     let kind = classify_ws_peek(&stream);
+    // Classification done: release the transient pending-peek slot and charge the durable pool.
+    drop(pending);
     match kind {
         WsKind::Healthz => {
-            drop(guard); // liveness probe: exempt from budgets, don't hold a mesh slot
-            serve_healthz(stream);
+            serve_healthz(stream); // liveness probe: exempt from every budget
         }
         WsKind::LogStream => {
-            drop(guard); // a log viewer must charge the log pool, never a mesh slot
-            let Some(log_guard) = admit_log_conn() else {
+            let Some(_log_guard) = admit_log_conn() else {
                 drop(stream); // log pool full: shed on the log budget
                 return;
             };
-            let _log_guard = log_guard; // releases the log slot on drop (incl. panic unwind)
             serve_ws(stream, kind, ev_tx);
         }
         WsKind::Upgrade => {
-            let _guard = guard; // a real mesh link keeps the mesh slot for its lifetime
+            let Some(_guard) = admit_conn() else {
+                drop(stream); // mesh cap full: a real mesh link sheds on the mesh budget
+                return;
+            };
             serve_ws(stream, kind, ev_tx);
         }
         WsKind::Empty => {
-            drop(guard);
             drop(stream); // no data / probe with no payload: nothing to serve
         }
     }
@@ -2051,17 +2068,19 @@ mod control_path_tests {
 
     #[test]
     fn admit_and_serve_ws_runs_classify_off_the_accept_thread_and_reconciles_budgets() {
-        // services-r3-02: the accept loop now charges a PROVISIONAL mesh slot and hands the socket to
-        // admit_and_serve_ws on a worker thread, which does the (timeout-bounded, slowloris-prone)
-        // peek there instead of inline. The correctness we protect: reconciliation to the right pool.
-        //   * A LogStream reconciles OFF the mesh slot ONTO the log pool: while it serves, exactly one
-        //     LOG slot and ZERO extra mesh slots are held, so a slow log viewer can never camp mesh.
-        //   * A Healthz / Empty releases the mesh slot entirely (no leak).
-        // Before the fix, the classify ran on the accept thread (stalling all accepts) AND there was
-        // no worker-side reconciliation seam; this test locks in the new accounting.
+        // services-r3-02 / r5-01: the accept loop admits against the PENDING-peek budget and hands the
+        // socket to admit_and_serve_ws on a worker thread, which does the (timeout-bounded,
+        // slowloris-prone) peek there instead of inline, then charges the REAL pool once the kind is
+        // known. The correctness we protect:
+        //   * Healthz is EXEMPT and served EVEN WHEN THE MESH POOL IS FULL (the r5-01 regression: the
+        //     r3-02 version charged a mesh slot up front, so at MAX_CONNS a healthz was shed, failing
+        //     the Cloud Run check and restart-looping the region organically, no attacker).
+        //   * A LogStream charges exactly one LOG slot and ZERO mesh slots, so a slow viewer can never
+        //     camp mesh; the whole mesh budget stays free while a log viewer serves.
+        //   * Healthz / Empty leave no slot held in any pool (no leak).
         use super::{
-            admit_and_serve_ws, admit_conn, ACTIVE_CONNS, ACTIVE_LOG_CONNS, MAX_CONNS,
-            MAX_LOG_CONNS,
+            admit_and_serve_ws, admit_conn, admit_ws_pending, ACTIVE_CONNS, ACTIVE_LOG_CONNS,
+            ACTIVE_WS_PENDING, MAX_CONNS, MAX_LOG_CONNS,
         };
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
@@ -2077,55 +2096,89 @@ mod control_path_tests {
         );
 
         // Helper: run admit_and_serve_ws on a worker (as the accept loop would), feeding it `req`.
-        // Returns once the handler returns (connection served + closed).
-        fn run(req: &[u8]) -> std::thread::JoinHandle<()> {
-            let guard = admit_conn().expect("provisional mesh slot admitted");
+        // Returns the bytes the client read back (so a caller can assert healthz actually SERVED a
+        // response rather than being shed) once the handler returns.
+        fn run(req: &[u8]) -> Vec<u8> {
+            let pending = admit_ws_pending().expect("pending-peek slot admitted");
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let req = req.to_vec();
-            std::thread::spawn(move || {
+            let client = std::thread::spawn(move || {
                 let mut c = TcpStream::connect(addr).unwrap();
                 c.write_all(&req).unwrap();
                 // Drain to EOF so the handler completes (healthz writes then closes).
                 let mut sink = Vec::new();
                 let _ = c.read_to_end(&mut sink);
+                sink
             });
             let (sock, _) = listener.accept().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(30)); // let the client send
             let (ev_tx, _ev_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                admit_and_serve_ws(sock, guard, &ev_tx);
+                admit_and_serve_ws(sock, pending, &ev_tx);
             })
-        }
-
-        // Healthz: served with NO slot held afterward (provisional mesh slot released, not leaked).
-        run(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
             .join()
             .unwrap();
+            client.join().unwrap()
+        }
+
+        // Healthz: served with NO slot held afterward (pending slot released, not leaked). The driver
+        // loop is not running in this test, so healthz reports 503 (stale tick) - the point is that it
+        // SERVES an HTTP response at all (200 or 503) rather than being shed (which returns nothing).
+        let resp = run(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            resp.windows(4).any(|w| w == b"HTTP"),
+            "healthz served an HTTP response (not shed)"
+        );
         assert_eq!(
             ACTIVE_CONNS.load(Ordering::SeqCst),
             0,
-            "healthz released the provisional mesh slot (no leak)"
+            "healthz charged NO mesh slot (exempt)"
         );
         assert_eq!(
             ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
             0,
             "healthz charged NO log slot either"
         );
+        assert_eq!(
+            ACTIVE_WS_PENDING.load(Ordering::SeqCst),
+            0,
+            "pending-peek slot released after classification"
+        );
 
-        // Empty: a probe with no payload releases the mesh slot and serves nothing.
-        run(b"").join().unwrap();
+        // r5-01 REGRESSION GUARD: with the mesh pool SATURATED to MAX_CONNS, a healthz still serves.
+        // The r3-02 code charged a mesh slot before classifying, so this shed the probe at the cap and
+        // organically restart-looped the region. Fill the mesh pool, then prove healthz is unaffected.
+        let mut mesh_full: Vec<_> = (0..MAX_CONNS)
+            .map(|_| admit_conn().expect("saturate the mesh pool"))
+            .collect();
+        assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), MAX_CONNS, "mesh full");
+        let resp = run(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            resp.windows(4).any(|w| w == b"HTTP"),
+            "healthz STILL serves an HTTP response with the mesh pool full (never shed at the mesh cap)"
+        );
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            MAX_CONNS,
+            "healthz did not touch the mesh pool (still exactly MAX_CONNS from our guards)"
+        );
+        mesh_full.clear();
+        assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), 0, "mesh pool released");
+
+        // Empty: a probe with no payload leaves no slot held and serves nothing.
+        run(b"");
         assert_eq!(
             ACTIVE_CONNS.load(Ordering::SeqCst),
             0,
-            "empty probe released the provisional mesh slot"
+            "empty probe held no mesh slot"
         );
 
         // LogStream: while it serves, it holds a LOG slot and NO mesh slot, and the full mesh budget
         // stays free (a real link is admissible even while a log viewer is being served). Use the
         // short-deadline test seam so the log handler closes promptly.
         std::env::set_var("HOP_LOG_STREAM_MAX_MS", "300");
-        let guard = admit_conn().expect("provisional mesh slot admitted");
+        let pending = admit_ws_pending().expect("pending-peek slot admitted");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -2137,7 +2190,7 @@ mod control_path_tests {
         let (sock, _) = listener.accept().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
         let (ev_tx, _ev_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || admit_and_serve_ws(sock, guard, &ev_tx));
+        let worker = std::thread::spawn(move || admit_and_serve_ws(sock, pending, &ev_tx));
         // Give the worker time to classify + reconcile onto the log pool, then observe mid-serve.
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert_eq!(
