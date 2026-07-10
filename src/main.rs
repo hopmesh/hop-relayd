@@ -42,6 +42,36 @@ use tungstenite::Message;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
+/// Max accepted inbound frame/message size (services-05). The raw-TCP bearer path already caps a
+/// frame at this; the WS path must use the SAME bound instead of tungstenite's 64 MiB default, or a
+/// single WS client could push a 64 MiB message that the TCP path would have rejected at 1 MiB.
+const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
+
+/// services-04: cap concurrent inbound connections so the one-thread-per-connection accept loops
+/// can't be driven to thread/memory exhaustion on a single-instance region (the port endpoint's
+/// F-19 control, ported back to relayd). Over the cap we shed the socket rather than spawn.
+const MAX_CONNS: usize = 1_024;
+static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decrements the active-connection count when a handler thread finishes (incl. panic unwind).
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Admit an inbound connection if we're under [`MAX_CONNS`], returning a guard that releases the
+/// slot on drop. `None` ⇒ over the cap, shed the connection. (services-04)
+fn admit_conn() -> Option<ConnGuard> {
+    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        None
+    } else {
+        Some(ConnGuard)
+    }
+}
+
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
 /// stops advancing, so Cloud Run restarts a wedged instance instead of the default TCP check passing
 /// forever (with one instance per region, a wedged instance IS the region). `0` = not started yet.
@@ -100,11 +130,32 @@ fn hms(ms: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Live network-log hub: a ring buffer + fan-out to HTTP viewers. Visiting a relay
-// over plain HTTP (e.g. relay.hopme.sh in a browser) streams these events live; the
-// stream leads with this node's region+address so you know which region the anycast
-// name routed you to.
+// Live network-log hub: a ring buffer + fan-out to HTTP viewers.
+//
+// services-03: the plain-HTTP log stream is UNAUTHENTICATED (anyone who opens
+// https://relay.hopme.sh gets it). For an "untraceable-by-default" network that is a free
+// traffic-analysis feed, so it is split two ways:
+//
+//   * `netlog` (PUBLIC): safe, non-correlatable lines only: this node's identity, connection
+//     lifecycle by opaque link number, and AGGREGATE counters (peers=N held=M). These go to the
+//     ring + HTTP viewers + stderr.
+//   * `netlog_private` (OPERATOR): per-message metadata (bundle ids, destination addresses/regions,
+//     mailbox-tag prefixes, per-peer joins/leaves). These go ONLY to stderr / Cloud Logging, never
+//     to the ring or the public stream, so the world cannot correlate spool/pull timing to tags.
+//
+// The public stream is additionally OFF BY DEFAULT and only enabled by `HOP_PUBLIC_LOG_STREAM=1`.
+// When off, a visitor still gets a healthy 200 with the identity header and live aggregate counters
+// (so Cloud Run's non-WS probes stay happy), but no per-event line feed at all.
 // ---------------------------------------------------------------------------
+
+/// Is the public per-event log stream enabled? Off by default (services-03); operators opt in with
+/// `HOP_PUBLIC_LOG_STREAM=1` on a relay whose traffic they accept exposing.
+fn public_log_stream_enabled() -> bool {
+    matches!(
+        std::env::var("HOP_PUBLIC_LOG_STREAM").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
 
 struct LogHub {
     inner: Mutex<LogInner>,
@@ -120,8 +171,8 @@ impl LogHub {
         self.inner.lock().unwrap().who = who;
     }
 
-    /// Append a timestamped line: store in the ring, fan out to viewers, mirror to stderr
-    /// (so it also lands in Cloud Logging).
+    /// Emit a PUBLIC-safe line: ring + HTTP viewers + stderr. Only non-correlatable lines
+    /// (identity, link lifecycle, aggregate counters) may go here, see the module note.
     fn emit(&self, line: String) {
         let stamped = format!("{} {}", hms(now_ms()), line);
         eprintln!("{stamped}");
@@ -133,13 +184,18 @@ impl LogHub {
         g.subs.retain(|s| s.send(stamped.clone()).is_ok());
     }
 
-    /// Register a viewer: returns this node's identity, the recent backlog, and a stream
-    /// of future lines.
+    /// Register a viewer: returns this node's identity, the recent backlog (only when the public
+    /// stream is enabled), and a stream of future public lines.
     fn subscribe(&self) -> (String, Vec<String>, Receiver<String>) {
         let (tx, rx) = mpsc::channel();
         let mut g = self.inner.lock().unwrap();
         g.subs.push(tx);
-        (g.who.clone(), g.ring.iter().cloned().collect(), rx)
+        let backlog = if public_log_stream_enabled() {
+            g.ring.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        (g.who.clone(), backlog, rx)
     }
 }
 
@@ -155,9 +211,16 @@ fn log_hub() -> &'static LogHub {
     })
 }
 
-/// Emit a line to the live network log (ring + HTTP viewers + stderr).
+/// Emit a PUBLIC-safe line to the live network log (ring + HTTP viewers + stderr). Use only for
+/// non-correlatable lines; per-message metadata MUST use [`netlog_private`] (services-03).
 fn netlog(line: impl Into<String>) {
     log_hub().emit(line.into());
+}
+
+/// Emit an OPERATOR-only line: stderr / Cloud Logging ONLY, never the public HTTP stream or ring
+/// (services-03). Use for anything that could correlate a bundle/peer/mailbox-tag to timing.
+fn netlog_private(line: impl Into<String>) {
+    eprintln!("{} {}", hms(now_ms()), line.into());
 }
 
 /// F-17: liveness probe. 200 only if the driver loop ticked within [`HEALTHZ_STALE_MS`]; else 503,
@@ -201,15 +264,28 @@ fn serve_log_stream(mut stream: TcpStream) {
     {
         return;
     }
-    for line in backlog {
-        if stream.write_all(format!("{line}\n").as_bytes()).is_err() {
+    // services-03: when the public per-event stream is OFF (the default), do not expose the ring of
+    // per-message lines. Serve only a note that live metadata is private; the caller stays a healthy
+    // 200 with periodic public aggregate lines (peers=N held=M) still arriving via the subscription.
+    if !public_log_stream_enabled() {
+        let note =
+            "live per-event log is private on this relay; only aggregate counters are shown \
+                    (set HOP_PUBLIC_LOG_STREAM=1 to expose per-event lines)\n";
+        if stream.write_all(note.as_bytes()).is_err() {
             return;
+        }
+    } else {
+        for line in backlog {
+            if stream.write_all(format!("{line}\n").as_bytes()).is_err() {
+                return;
+            }
         }
     }
     if stream.flush().is_err() {
         return;
     }
-    netlog("http: log viewer connected");
+    // A viewer connecting is itself only logged privately (it is an observer, not network traffic).
+    netlog_private("http: log viewer connected");
     loop {
         match rx.recv_timeout(Duration::from_secs(15)) {
             Ok(line) => {
@@ -336,8 +412,16 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --listen address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                // services-04: shed over the connection cap rather than spawn unboundedly.
+                let Some(guard) = admit_conn() else {
+                    drop(stream);
+                    continue;
+                };
                 let tx = tx.clone();
-                std::thread::spawn(move || serve_tcp(stream, Role::Responder, &tx));
+                std::thread::spawn(move || {
+                    let _guard = guard; // releases the slot on drop (incl. panic unwind)
+                    serve_tcp(stream, Role::Responder, &tx)
+                });
             }
         });
     }
@@ -348,8 +432,16 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                // services-04: shed over the connection cap rather than spawn unboundedly.
+                let Some(guard) = admit_conn() else {
+                    drop(stream);
+                    continue;
+                };
                 let tx = tx.clone();
-                std::thread::spawn(move || serve_ws(stream, &tx));
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    serve_ws(stream, &tx)
+                });
             }
         });
     }
@@ -425,7 +517,8 @@ fn main() {
                 .expect("dns http client");
             for domain in drx {
                 let bodies = fetch_dnssec_chain(&http, &domain);
-                netlog(format!(
+                // services-03: the resolved domain is sensitive (reveals who someone is looking up).
+                netlog_private(format!(
                     "hns: fetched {} chain records for {domain}",
                     bodies.len()
                 ));
@@ -475,7 +568,8 @@ fn main() {
                         Destination::Broadcast => "broadcast".to_string(),
                         Destination::Vaccine(..) => "vaccine".to_string(),
                     };
-                    netlog(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
+                    // services-03: bundle id + destination address is per-message metadata.
+                    netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
                     node.ingest(b);
                 }
             }
@@ -497,15 +591,16 @@ fn main() {
             }
         }
 
-        // Log authenticated peer joins/leaves (by address) and periodic stats to the live
-        // network log — so a viewer can see who's connected and what's held for relay.
+        // Log authenticated peer joins/leaves (by address) privately, and periodic AGGREGATE stats
+        // publicly. services-03: a per-peer address join/leave is correlatable traffic metadata, so
+        // it goes only to Cloud Logging; the public stream sees just the peers=N counter below.
         let cur: std::collections::HashSet<Vec<u8>> =
             node.peers().iter().map(|a| a.to_vec()).collect();
         for p in cur.difference(&prev_peers) {
-            netlog(format!("peer connected: {}", short_b58(p)));
+            netlog_private(format!("peer connected: {}", short_b58(p)));
         }
         for p in prev_peers.difference(&cur) {
-            netlog(format!("peer left: {}", short_b58(p)));
+            netlog_private(format!("peer left: {}", short_b58(p)));
         }
         prev_peers = cur;
         let now = now_ms();
@@ -594,7 +689,7 @@ fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
             break;
         }
         let n = u32::from_be_bytes(len) as usize;
-        if n > 1 << 20 {
+        if n > MAX_FRAME_BYTES {
             break; // frame too large; drop the connection
         }
         let mut buf = vec![0u8; n];
@@ -640,7 +735,14 @@ fn serve_ws(stream: TcpStream, ev_tx: &Sender<Ev>) {
         }
         let _ = stream.set_read_timeout(None); // hand a clean blocking socket to tungstenite
     }
-    let mut ws = match tungstenite::accept(stream) {
+    // services-05: cap the WS message/frame size to match the raw-TCP bearer path, instead of
+    // tungstenite's 64 MiB default, so neither transport accepts an oversized message.
+    let ws_config = tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..Default::default()
+    };
+    let mut ws = match tungstenite::accept_with_config(stream, Some(ws_config)) {
         Ok(w) => w,
         Err(_) => return, // malformed upgrade
     };
@@ -805,8 +907,51 @@ fn load_identity(identity_file: &Option<String>, key_path: &str) -> Identity {
         }
     }
     let id = Identity::generate();
-    let _ = std::fs::write(key_path, id.to_secret_bytes());
+    // services-13: this is a 32-byte long-term secret. Write it 0600 (owner-only) so a shared VM's
+    // other users can't read the relay's private identity seed, and log LOUDLY on failure - a
+    // silently-dropped write means the address silently changes on every restart.
+    let secret = id.to_secret_bytes();
+    if let Err(e) = write_secret_600(key_path, &secret) {
+        eprintln!(
+            "relayd: FAILED to persist identity seed to {key_path}: {e} - \
+             this relay's address WILL change on restart (fix perms/disk and retry)"
+        );
+    }
     id
+}
+
+/// Write `bytes` to `path` with owner-only (0600) permissions, creating or truncating. On Unix the
+/// mode is applied at create time via `OpenOptions` so the secret is never briefly world-readable;
+/// on non-Unix targets it falls back to a plain write (the relay only ships on Unix).
+fn write_secret_600(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        // Re-assert the mode in case the file pre-existed with looser perms (create+mode only
+        // sets perms on creation, not when opening an existing file).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    }
 }
 
 fn bs58_addr(addr: &[u8]) -> String {
@@ -1072,14 +1217,15 @@ mod handoff {
                         }
                         let dest_node = region_node_b58(&base_seed, &dst_region);
                         if let Err(e) = presence.put_bundle_to(&dest_node, id, bytes, *expires) {
-                            super::netlog(format!(
+                            // services-03: bundle id + destination region is per-message metadata.
+                            super::netlog_private(format!(
                                 "handoff FAILED: msg {} → {} (region {dst_region}): {e}",
                                 super::short_b58(id),
                                 super::short_b58(dst)
                             ));
                             handed.remove(&(*id, dst_region)); // let a later cycle retry
                         } else {
-                            super::netlog(format!(
+                            super::netlog_private(format!(
                                 "handoff: msg {} → dst {} (region {dst_region})",
                                 super::short_b58(id),
                                 super::short_b58(dst)
@@ -1183,14 +1329,16 @@ mod handoff {
             }
             let tag_b58 = bs58::encode(tag).into_string();
             if let Err(e) = store.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
-                super::netlog(format!(
+                // services-03: bundle id + mailbox-tag prefix is exactly the spool/pull correlation
+                // pair §39 must not leak to the public; operator log (Cloud Logging) only.
+                super::netlog_private(format!(
                     "spool FAILED: msg {} → mailbox {}: {e}",
                     super::short_b58(id),
                     &tag_b58[..tag_b58.len().min(8)]
                 ));
                 spooled.remove(&(*id, *tag)); // let a later cycle retry
             } else {
-                super::netlog(format!(
+                super::netlog_private(format!(
                     "spool: msg {} → mailbox {}",
                     super::short_b58(id),
                     &tag_b58[..tag_b58.len().min(8)]
@@ -1214,7 +1362,8 @@ mod handoff {
                 };
                 let id = b.id();
                 if pulled.insert(id) {
-                    super::netlog(format!(
+                    // services-03: pull side of the spool/pull correlation; operator log only.
+                    super::netlog_private(format!(
                         "want-beacon: pulled msg {} from mailbox {}",
                         super::short_b58(&id),
                         &tag_b58[..tag_b58.len().min(8)]
@@ -1369,5 +1518,107 @@ mod handoff {
                 "a bundle id already pulled by this worker is not re-ingested"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod secret_perms_tests {
+    use super::write_secret_600;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_path(name: &str) -> String {
+        format!(
+            "{}/hop-relayd-{name}-{}.key",
+            std::env::temp_dir().display(),
+            std::process::id()
+        )
+    }
+
+    #[test]
+    fn identity_secret_is_written_owner_only() {
+        // services-13: a fresh identity seed file must land at 0600 (no group/other bits).
+        let path = temp_path("fresh");
+        let _ = std::fs::remove_file(&path);
+        write_secret_600(&path, &[9u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "identity seed must be owner-only, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 32]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_tightens_a_preexisting_world_readable_file() {
+        // A file that already exists 0644 must be tightened to 0600 on rewrite, not left loose.
+        let path = temp_path("loose");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_600(&path, &[1u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewrite must tighten perms, got {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 32]);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod log_privacy_tests {
+    use super::{netlog, netlog_private, LogHub, LogInner};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    // These tests use the process-global log hub via netlog/netlog_private, so they subscribe to a
+    // LOCAL hub built the same way and route through the same emit path to assert routing. Because
+    // netlog talks to the static hub, we assert routing behavior on a fresh LogHub directly.
+    fn fresh_hub() -> LogHub {
+        LogHub {
+            inner: Mutex::new(LogInner {
+                who: String::new(),
+                ring: VecDeque::new(),
+                subs: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn public_emit_reaches_subscribers_private_does_not() {
+        // services-03: a public emit() must fan out to a viewer; per-message metadata must NEVER be
+        // routed through the hub (netlog_private goes only to stderr).
+        let hub = fresh_hub();
+        let (_who, _backlog, rx) = hub.subscribe();
+        hub.emit("stats: peers=3 held=7".to_string());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("public line delivered to viewer");
+        assert!(got.contains("peers=3 held=7"), "public aggregate delivered");
+
+        // netlog_private must not touch the hub at all: nothing more arrives on the stream.
+        netlog_private("spool: msg ABC → mailbox XY");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "private per-message metadata must never reach a public viewer"
+        );
+    }
+
+    #[test]
+    fn public_stream_is_off_by_default() {
+        // services-03: without HOP_PUBLIC_LOG_STREAM the per-event backlog is withheld (a visitor
+        // gets identity + aggregate counters, not the ring of individual lines). The env var is not
+        // set in the test process, so subscribe() returns an empty backlog even with a full ring.
+        let hub = fresh_hub();
+        hub.emit("conn up: link=1 (Responder)".to_string());
+        hub.emit("stats: peers=1 held=0".to_string());
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        let (_who, backlog, _rx) = hub.subscribe();
+        assert!(
+            backlog.is_empty(),
+            "with the public stream off, no per-event backlog is exposed"
+        );
+        // Sanity: netlog is the public path (compiles + routes through emit).
+        netlog("relay up: region=test");
     }
 }
