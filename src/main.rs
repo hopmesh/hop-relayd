@@ -238,6 +238,20 @@ fn public_log_stream_enabled() -> bool {
 #[cfg(test)]
 static PUBLIC_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Serializes tests that read/write the process-global driver statics (LAST_TICK_MS, SHUTDOWN) so a
+// concurrent test can't observe another's transient value (e.g. driver_step storing a fresh tick
+// while a healthz test asserts a stale one). Shared across the healthz / driver-loop / shutdown test
+// modules. Recover from poisoning so one failing assertion reports ITS failure, not a cascade.
+#[cfg(test)]
+static DRIVER_STATICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn lock_driver_statics() -> std::sync::MutexGuard<'static, ()> {
+    DRIVER_STATICS_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 struct LogHub {
     inner: Mutex<LogInner>,
 }
@@ -308,24 +322,31 @@ fn netlog_private(line: impl Into<String>) {
 /// so Cloud Run's startup/liveness probe restarts a wedged instance. This is a container-level probe
 /// (Cloud Run hits it internally); do NOT wire an external uptime check against region endpoints —
 /// DESIGN.md §1436 forbids externally probing regions because it wakes scaled-to-zero instances.
-fn serve_healthz(mut stream: TcpStream) {
-    let last = LAST_TICK_MS.load(Ordering::Relaxed);
-    let healthy = last != 0 && now_ms().saturating_sub(last) < HEALTHZ_STALE_MS;
-    // stores-09: surface the durable store's dropped-op count. We do NOT flip to 503 on drops (a
-    // restart won't fix a Firestore outage and would drop the in-memory hot path too); we report it
-    // in the body so a monitor/operator sees the relay is not currently durable. Only a wedged
-    // driver (stale tick) is a restart-worthy 503.
-    let dropped = MIRROR_DROPPED
-        .get()
-        .map(|d| d.load(Ordering::Relaxed))
-        .unwrap_or(0);
-    let (status, body) = if !healthy {
+/// The (status line, body) a health probe returns for a given last-tick, now, and durable-store
+/// dropped-op count. Extracted from [`serve_healthz`] so all three outcomes (stale 503, degraded
+/// 200, healthy 200) are unit-testable without driving the process-global tick/mirror statics.
+///
+/// stores-09: a nonzero `dropped` reports "degraded" in the body but stays 200 (we do NOT flip to 503
+/// on drops: a restart won't fix a Firestore outage and would drop the in-memory hot path too). Only
+/// a wedged driver (stale tick) is a restart-worthy 503.
+fn healthz_status(last_tick_ms: u64, now: u64, dropped: u64) -> (&'static str, String) {
+    let healthy = last_tick_ms != 0 && now.saturating_sub(last_tick_ms) < HEALTHZ_STALE_MS;
+    if !healthy {
         ("503 Service Unavailable", "stale".to_string())
     } else if dropped > 0 {
         ("200 OK", format!("ok degraded: mirror_dropped={dropped}"))
     } else {
         ("200 OK", "ok".to_string())
-    };
+    }
+}
+
+fn serve_healthz(mut stream: TcpStream) {
+    let last = LAST_TICK_MS.load(Ordering::Relaxed);
+    let dropped = MIRROR_DROPPED
+        .get()
+        .map(|d| d.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let (status, body) = healthz_status(last, now_ms(), dropped);
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -428,104 +449,328 @@ fn serve_log_stream(mut stream: TcpStream) {
     }
 }
 
-fn main() {
-    install_shutdown_handler(); // F-21: drain the durable store on SIGTERM before the instance is reaped
-    let mut listen: Option<String> = None;
-    let mut ws: Option<String> = None;
-    let mut db = "hop-relay.db".to_string();
-    let mut identity_file: Option<String> = None;
-    let mut peers: Vec<String> = Vec::new();
-    let mut firestore: Option<String> = None;
-    let mut region: Option<String> = None;
-    let mut advertise: Option<String> = None;
-    let mut mesh_fanout: usize = 0; // 0 = handoff-only (no relay-to-relay dialing); >0 enables it
-    let mut args = std::env::args().skip(1);
+/// The relay's parsed command-line configuration. Extracted from `main` so the arg grammar
+/// (per-flag defaults, the bare-invocation TCP fallback, and `--mesh-fanout` integer parsing) is
+/// unit-testable without spawning the daemon.
+struct Config {
+    listen: Option<String>,
+    ws: Option<String>,
+    db: String,
+    identity_file: Option<String>,
+    peers: Vec<String>,
+    firestore: Option<String>,
+    region: Option<String>,
+    advertise: Option<String>,
+    /// 0 = handoff-only (no relay-to-relay dialing); >0 enables online-only epidemic fan-out.
+    mesh_fanout: usize,
+}
+
+/// Parse the relay's command-line flags. A bare invocation (no `--listen`/`--ws`) defaults to the
+/// path-A TCP bearer on 9443; unknown flags are ignored with a warning; `--mesh-fanout` falls back
+/// to 0 on a missing/unparseable value.
+fn parse_args(args: impl Iterator<Item = String>) -> Config {
+    let mut cfg = Config {
+        listen: None,
+        ws: None,
+        db: "hop-relay.db".to_string(),
+        identity_file: None,
+        peers: Vec::new(),
+        firestore: None,
+        region: None,
+        advertise: None,
+        mesh_fanout: 0,
+    };
+    let mut args = args;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--listen" => listen = args.next(),
-            "--ws" => ws = args.next(),
-            "--db" => db = args.next().unwrap_or(db),
-            "--identity-file" => identity_file = args.next(),
-            "--firestore" => firestore = args.next(), // GCP project id → durable per-node store
-            "--region" => region = args.next(),       // this node's region (registry, §28)
-            "--advertise" => advertise = args.next(), // our connectable wss:// endpoint for peers
+            "--listen" => cfg.listen = args.next(),
+            "--ws" => cfg.ws = args.next(),
+            "--db" => {
+                if let Some(d) = args.next() {
+                    cfg.db = d;
+                }
+            }
+            "--identity-file" => cfg.identity_file = args.next(),
+            "--firestore" => cfg.firestore = args.next(), // GCP project id → durable per-node store
+            "--region" => cfg.region = args.next(),       // this node's region (registry, §28)
+            "--advertise" => cfg.advertise = args.next(), // our connectable wss:// endpoint
             // Online-only relay-to-relay epidemic fan-out (DESIGN.md §28): dial up to N
             // *currently-online* peer relays (never wakes a sleeping one). 0 = off.
-            "--mesh-fanout" => mesh_fanout = args.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--mesh-fanout" => {
+                cfg.mesh_fanout = args.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+            }
             "--peer" => {
                 if let Some(p) = args.next() {
-                    peers.push(p);
+                    cfg.peers.push(p);
                 }
             }
             other => eprintln!("ignoring unknown arg: {other}"),
         }
     }
     // Preserve the path-A default: a bare invocation listens on TCP 9443.
-    if listen.is_none() && ws.is_none() {
-        listen = Some("0.0.0.0:9443".to_string());
+    if cfg.listen.is_none() && cfg.ws.is_none() {
+        cfg.listen = Some("0.0.0.0:9443".to_string());
     }
+    cfg
+}
 
-    let mut identity = load_identity(&identity_file, &format!("{db}.key"));
-    // The shared base seed — every region derives its node identity from this same seed,
-    // so any node can compute any other region's address (cross-partition handoff, §28).
-    let base_seed = identity.to_secret_bytes();
-    // Per-region backbone node: derive a stable, distinct identity from the shared seed
-    // and the region name, so each region is its own node (own Firestore partition +
-    // liveness-registry entry) without needing a separate secret per region (§27/§28).
-    if let Some(r) = &region {
-        identity = Identity::from_secret_bytes(&region_seed(&base_seed, r));
+/// Derive this node's effective identity: a per-region backbone identity when `--region` is set
+/// (each region is its own node/partition, §27/§28), else the base identity unchanged. Extracted
+/// so the region-derivation branch is unit-testable.
+fn regional_identity(base: Identity, base_seed: &[u8; 32], region: Option<&str>) -> Identity {
+    if let Some(r) = region {
+        // Per-region backbone node: a stable, distinct identity from the shared seed + region name,
+        // so each region is its own node (own Firestore partition + liveness-registry entry)
+        // without needing a separate secret per region.
+        let id = Identity::from_secret_bytes(&region_seed(base_seed, r));
         println!(
             "hop-relayd: region={r} derived address {}",
-            bs58_addr(&identity.address())
+            bs58_addr(&id.address())
         );
+        id
+    } else {
+        base
     }
-    let addr = identity.address();
-    let store = build_store(&firestore, &db, &addr);
-    let mut node = Node::with_store(identity, store);
-    // Cloud node: a much larger learned-route table than a phone (DESIGN.md §27) so the
-    // backbone becomes the long-memory route learner, and stamp the Hop-relay app id so
-    // a relay hop shows as "Hop Relay" in traces.
+}
+
+/// Apply the cloud-relay node parameters (a much larger learned-route table + custody window than a
+/// phone, the relay app id/kind, and, when advertising, the identify name from the endpoint host).
+/// Extracted so the relay-specific node configuration is unit-testable.
+fn configure_node<S: Store>(node: &mut Node<S>, advertise: Option<&str>) {
+    // Cloud node: a much larger learned-route table than a phone (DESIGN.md §27) so the backbone
+    // becomes the long-memory route learner.
     node.set_route_capacity(200_000);
-    // Cloud relays run a large custody window — with forward-before-evict this is a
-    // sliding window of concurrent in-flight bundles (incl. chunked media), not a cap on
-    // transfer size, so many simultaneous large transfers can pass through (DESIGN.md §6).
+    // A large custody window: with forward-before-evict this is a sliding window of concurrent
+    // in-flight bundles (incl. chunked media), not a cap on transfer size (DESIGN.md §6).
     node.set_max_relayed(8192);
+    // Stamp the Hop-relay app id so a relay hop shows as "Hop Relay" in traces.
     node.set_app(hop_core::relay_app_id());
-    // Answer hop.identify as a relay, named by its public domain (the host of --advertise,
-    // e.g. us-central1.relay.hopme.sh) so trace resolution shows relays by domain (§29).
+    // Answer hop.identify as a relay, named by its public domain (the host of --advertise, e.g.
+    // us-central1.relay.hopme.sh) so trace resolution shows relays by domain (§29).
     node.set_kind(NodeKind::Relay);
-    if let Some(adv) = &advertise {
+    if let Some(adv) = advertise {
         node.set_name(Some(host_of(adv)));
     }
-    // The cloud relay is internet-connected, so it serves as an HNS resolver for peers that
-    // ask it (DESIGN.md §30). Resolution still works without it — any internet-connected peer
-    // resolves on its own — but an always-on relay is a convenient recursive resolver.
+    // The cloud relay is internet-connected, so it serves as an HNS resolver for peers that ask it
+    // (DESIGN.md §30). Resolution still works without it, but an always-on relay is convenient.
     #[cfg(feature = "firestore")]
     node.set_internet(true);
+}
+
+/// Emit the startup banners (stdout) and seed the live-log identity + "relay up" line, so a visitor
+/// to the anycast name sees which region answered. Extracted so the identity/region strings the log
+/// stream leads with are unit-testable.
+fn announce_startup(
+    listen: Option<&str>,
+    ws: Option<&str>,
+    peer_count: usize,
+    addr: &[u8],
+    region: Option<&str>,
+) {
     println!(
         "hop-relayd: address {} {}{}{} backbone peer(s)",
-        bs58_addr(&addr),
-        listen
-            .as_deref()
-            .map(|l| format!("tcp {l} "))
-            .unwrap_or_default(),
-        ws.as_deref()
-            .map(|w| format!("ws {w} "))
-            .unwrap_or_default(),
-        peers.len(),
+        bs58_addr(addr),
+        listen.map(|l| format!("tcp {l} ")).unwrap_or_default(),
+        ws.map(|w| format!("ws {w} ")).unwrap_or_default(),
+        peer_count,
     );
-    // Identify this node in the live HTTP log stream (so a visitor to the anycast name
-    // sees which region answered).
+    // Identify this node in the live HTTP log stream (so a visitor to the anycast name sees which
+    // region answered).
     log_hub().set_identity(format!(
         "region={} node={}",
-        region.as_deref().unwrap_or("local"),
-        bs58_addr(&addr)
+        region.unwrap_or("local"),
+        bs58_addr(addr)
     ));
     netlog(format!(
         "relay up: region={} node={}",
-        region.as_deref().unwrap_or("local"),
-        bs58_addr(&addr)
+        region.unwrap_or("local"),
+        bs58_addr(addr)
     ));
+}
+
+/// Apply one driver event to the node + the per-link writer table. Extracted from the driver loop so
+/// the event-handling logic (link up/down bookkeeping, data hand-off, ingest of a durable-store
+/// bundle) is unit-testable with a real `Node`; the loop itself only wraps this with the recv
+/// timeout tick and the shutdown drain.
+fn apply_event<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>, ev: Ev) {
+    match ev {
+        Ev::Up(link, role, out) => {
+            writers.insert(link, out);
+            netlog(format!("conn up: link={link} ({role:?})"));
+            node.handle(BearerEvent::Connected(link, role));
+        }
+        Ev::Data(link, bytes) => node.handle(BearerEvent::Data(link, bytes)),
+        Ev::Down(link) => {
+            writers.remove(&link);
+            netlog(format!("conn down: link={link}"));
+            node.handle(BearerEvent::Disconnected(link));
+        }
+        Ev::Ingest(bytes) => {
+            if let Ok(b) = Bundle::from_bytes(&bytes) {
+                let dst = match b.inner.dst {
+                    Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
+                    Destination::Broadcast => "broadcast".to_string(),
+                    Destination::Vaccine(..) => "vaccine".to_string(),
+                };
+                // services-03: bundle id + destination address is per-message metadata.
+                netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
+                node.ingest(b);
+            }
+        }
+        #[cfg(feature = "firestore")]
+        Ev::DnsProof(domain, bodies) => node.provide_dns_proof(&domain, bodies),
+    }
+}
+
+/// Drain the node's outgoing link packets to each link's writer thread, dropping a writer whose
+/// thread has gone. Extracted from the driver loop for unit testing.
+fn pump_outgoing<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>) {
+    for (link, bytes) in node.drain_outgoing() {
+        if let Some(out) = writers.get(&link) {
+            if out.send(bytes).is_err() {
+                writers.remove(&link); // connection's writer thread is gone
+            }
+        }
+    }
+}
+
+/// Log authenticated peer joins/leaves (by address) privately and return the new peer set.
+/// services-03: a per-peer address join/leave is correlatable traffic metadata, so it goes only to
+/// Cloud Logging; the public stream sees just the aggregate peers=N counter (via [`maybe_emit_stats`]).
+fn log_peer_changes<S: Store>(
+    node: &Node<S>,
+    prev: &std::collections::HashSet<Vec<u8>>,
+) -> std::collections::HashSet<Vec<u8>> {
+    let cur: std::collections::HashSet<Vec<u8>> = node.peers().iter().map(|a| a.to_vec()).collect();
+    for p in cur.difference(prev) {
+        netlog_private(format!("peer connected: {}", short_b58(p)));
+    }
+    for p in prev.difference(&cur) {
+        netlog_private(format!("peer left: {}", short_b58(p)));
+    }
+    cur
+}
+
+/// Emit the periodic public AGGREGATE stats line (peers=N held=M) at most every 10s. Returns the
+/// updated `last_stats_ms` (unchanged when it isn't time yet). Extracted from the driver loop for
+/// unit testing.
+fn maybe_emit_stats<S: Store>(node: &Node<S>, last_stats_ms: u64, now: u64) -> u64 {
+    if now.saturating_sub(last_stats_ms) >= 10_000 {
+        netlog(format!(
+            "stats: peers={} held={}",
+            node.peers().len(),
+            node.queue().len()
+        ));
+        now
+    } else {
+        last_stats_ms
+    }
+}
+
+/// One iteration of the driver loop: advance the F-17 healthz heartbeat, on SIGTERM drain the durable
+/// store and signal exit (F-21), then process one event (or, on the recv timeout, tick), pump
+/// outgoing packets, and log peer/stat changes. Returns `false` when the loop should exit (SIGTERM
+/// drain done, or the event channel closed). Extracted from `main` so the per-iteration control flow
+/// is unit-testable; the firestore-only worker dispatch (DoH lookups + handoff snapshots) stays in
+/// `main` and runs after each step.
+fn driver_step<S: Store>(
+    node: &mut Node<S>,
+    writers: &mut HashMap<u64, Sender<Vec<u8>>>,
+    rx: &Receiver<Ev>,
+    prev_peers: &mut std::collections::HashSet<Vec<u8>>,
+    last_stats_ms: &mut u64,
+) -> bool {
+    // F-17: heartbeat for /healthz. The loop iterates at least once per second (recv timeout → tick);
+    // if node.handle/tick ever deadlocks, this stops advancing and /healthz goes 503.
+    LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+    // F-21: on SIGTERM, drain the durable store's pending mirror queue before exiting, so a
+    // spool/handoff write accepted just before Cloud Run reaps us survives. Cloud Run grants a grace
+    // window on shutdown; bound the flush well inside it.
+    if SHUTDOWN.load(Ordering::SeqCst) {
+        let flushed = node.store.flush(Duration::from_secs(8));
+        netlog(format!(
+            "SIGTERM: durable-store flush {} — exiting",
+            if flushed { "drained" } else { "timed out" }
+        ));
+        return false;
+    }
+    match rx.recv_timeout(Duration::from_millis(1000)) {
+        Ok(ev) => apply_event(node, writers, ev),
+        Err(RecvTimeoutError::Timeout) => node.tick(now_ms()),
+        Err(RecvTimeoutError::Disconnected) => return false,
+    }
+    pump_outgoing(node, writers);
+    // Log authenticated peer joins/leaves privately; emit periodic public AGGREGATE stats.
+    *prev_peers = log_peer_changes(node, prev_peers);
+    *last_stats_ms = maybe_emit_stats(node, *last_stats_ms, now_ms());
+    true
+}
+
+/// One iteration of the raw-TCP accept loop: admit against the mesh cap (services-04), shedding the
+/// socket when over it, else spawn a per-connection `serve_tcp` handler that holds the slot guard for
+/// its lifetime. Extracted so the admit-or-shed decision is unit-testable over a loopback socket.
+fn spawn_tcp_conn(stream: TcpStream, ev_tx: &Sender<Ev>) {
+    let Some(guard) = admit_conn() else {
+        drop(stream); // services-04: shed over the connection cap rather than spawn unboundedly
+        return;
+    };
+    let ev_tx = ev_tx.clone();
+    std::thread::spawn(move || {
+        let _guard = guard; // releases the slot on drop (incl. panic unwind)
+        serve_tcp(stream, Role::Responder, &ev_tx)
+    });
+}
+
+/// One iteration of the WebSocket accept loop. services-r7-01: a non-blocking `GET /healthz`
+/// fast-path serves the Cloud Run liveness probe EXEMPT from every budget (a slowloris filling
+/// MAX_WS_PENDING can no longer starve it, and an empty buffer returns instantly so a silent slowloris
+/// never stalls this loop). services-r3-02 / r5-01: every other connection is admitted only against
+/// the cheap PENDING-peek budget and handed to `admit_and_serve_ws` on a worker thread, so the
+/// timeout-bounded peek/classify never stalls this accept path and the mesh cap is charged only after
+/// the kind is known. Extracted so the fast-path/admit decision is unit-testable.
+fn dispatch_ws_accept(stream: TcpStream, ev_tx: &Sender<Ev>) {
+    if peek_is_healthz(&stream) {
+        std::thread::spawn(move || serve_healthz(stream));
+        return;
+    }
+    let Some(pending) = admit_ws_pending() else {
+        drop(stream); // too many connections mid-classification: shed (bounded spawn)
+        return;
+    };
+    let ev_tx = ev_tx.clone();
+    std::thread::spawn(move || admit_and_serve_ws(stream, pending, &ev_tx));
+}
+
+fn main() {
+    install_shutdown_handler(); // F-21: drain the durable store on SIGTERM before the instance is reaped
+    let Config {
+        listen,
+        ws,
+        db,
+        identity_file,
+        peers,
+        firestore,
+        region,
+        advertise,
+        mesh_fanout,
+    } = parse_args(std::env::args().skip(1));
+
+    let base_identity = load_identity(&identity_file, &format!("{db}.key"));
+    // The shared base seed — every region derives its node identity from this same seed, so any
+    // node can compute any other region's address (cross-partition handoff, §28).
+    let base_seed = base_identity.to_secret_bytes();
+    let identity = regional_identity(base_identity, &base_seed, region.as_deref());
+    let addr = identity.address();
+    let store = build_store(&firestore, &db, &addr);
+    let mut node = Node::with_store(identity, store);
+    configure_node(&mut node, advertise.as_deref());
+    announce_startup(
+        listen.as_deref(),
+        ws.as_deref(),
+        peers.len(),
+        &addr,
+        region.as_deref(),
+    );
 
     let (tx, rx) = mpsc::channel::<Ev>();
 
@@ -535,16 +780,7 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --listen address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-04: shed over the connection cap rather than spawn unboundedly.
-                let Some(guard) = admit_conn() else {
-                    drop(stream);
-                    continue;
-                };
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let _guard = guard; // releases the slot on drop (incl. panic unwind)
-                    serve_tcp(stream, Role::Responder, &tx)
-                });
+                spawn_tcp_conn(stream, &tx);
             }
         });
     }
@@ -555,35 +791,7 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-r7-01: a NON-BLOCKING healthz fast-path that a slowloris cannot starve. A
-                // Cloud Run liveness probe sends "GET /healthz" WITH the connection (same-host, one
-                // packet), so those bytes are already buffered by the time accept() returns. Peek them
-                // WITHOUT blocking (an empty buffer returns WouldBlock instantly, so a silent slowloris
-                // never stalls this loop) and, if it is a healthz probe, serve it EXEMPT from every
-                // budget on its own thread. This is what stops the r5 residual: a slowloris that fills
-                // MAX_WS_PENDING can no longer shed the liveness probe (which shared the WS port and was
-                // gated by that same pending budget before classification), so the container is not
-                // falsely restarted mid-attack. Non-healthz / not-yet-buffered connections fall through
-                // to the normal budgeted classify path unchanged.
-                if peek_is_healthz(&stream) {
-                    std::thread::spawn(move || serve_healthz(stream));
-                    continue;
-                }
-                // services-r3-02 / r5-01: the full peek+classify MUST NOT run on this accept thread. It
-                // has a multi-second read timeout, so one silent slowloris (connect, send nothing)
-                // would serially stall EVERY new accept here (mesh links, log viewers, healthz
-                // probes) behind its peek. So we admit against the PENDING-peek budget (NOT the mesh
-                // budget) and spawn immediately; the peek/classify then runs on the WORKER thread,
-                // where a slowloris only stalls its own connection. Gating on the pending budget
-                // rather than a provisional mesh slot is what keeps `/healthz` and mesh links from
-                // being shed at the mesh cap before their kind is even known; the worker charges the
-                // real pool (mesh/log) only AFTER classification.
-                let Some(pending) = admit_ws_pending() else {
-                    drop(stream); // too many connections mid-classification: shed (bounded spawn)
-                    continue;
-                };
-                let tx = tx.clone();
-                std::thread::spawn(move || admit_and_serve_ws(stream, pending, &tx));
+                dispatch_ws_accept(stream, &tx);
             }
         });
     }
@@ -677,82 +885,19 @@ fn main() {
     #[cfg(feature = "firestore")]
     let mut last_handoff_ms: u64 = 0;
     loop {
-        // F-17: heartbeat for /healthz. The loop iterates at least once per second (recv timeout →
-        // tick); if node.handle/tick ever deadlocks, this stops advancing and /healthz goes 503.
-        LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
-        // F-21: on SIGTERM, drain the durable store's pending mirror queue before exiting, so a
-        // spool/handoff write accepted just before Cloud Run reaps us survives. Cloud Run grants a
-        // grace window on shutdown; bound the flush well inside it.
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            let flushed = node.store.flush(Duration::from_secs(8));
-            netlog(format!(
-                "SIGTERM: durable-store flush {} — exiting",
-                if flushed { "drained" } else { "timed out" }
-            ));
+        if !driver_step(
+            &mut node,
+            &mut writers,
+            &rx,
+            &mut prev_peers,
+            &mut last_stats_ms,
+        ) {
             break;
-        }
-        match rx.recv_timeout(Duration::from_millis(1000)) {
-            Ok(Ev::Up(link, role, out)) => {
-                writers.insert(link, out);
-                netlog(format!("conn up: link={link} ({role:?})"));
-                node.handle(BearerEvent::Connected(link, role));
-            }
-            Ok(Ev::Data(link, bytes)) => node.handle(BearerEvent::Data(link, bytes)),
-            Ok(Ev::Down(link)) => {
-                writers.remove(&link);
-                netlog(format!("conn down: link={link}"));
-                node.handle(BearerEvent::Disconnected(link));
-            }
-            Ok(Ev::Ingest(bytes)) => {
-                if let Ok(b) = Bundle::from_bytes(&bytes) {
-                    let dst = match b.inner.dst {
-                        Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
-                        Destination::Broadcast => "broadcast".to_string(),
-                        Destination::Vaccine(..) => "vaccine".to_string(),
-                    };
-                    // services-03: bundle id + destination address is per-message metadata.
-                    netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
-                    node.ingest(b);
-                }
-            }
-            #[cfg(feature = "firestore")]
-            Ok(Ev::DnsProof(domain, bodies)) => node.provide_dns_proof(&domain, bodies),
-            Err(RecvTimeoutError::Timeout) => node.tick(now_ms()),
-            Err(RecvTimeoutError::Disconnected) => break,
         }
         // Dispatch any HNS lookups the node wants to the DoH worker (DESIGN.md §30).
         #[cfg(feature = "firestore")]
         for domain in node.take_dns_lookups() {
             let _ = dns_tx.send(domain);
-        }
-        for (link, bytes) in node.drain_outgoing() {
-            if let Some(out) = writers.get(&link) {
-                if out.send(bytes).is_err() {
-                    writers.remove(&link); // connection's writer thread is gone
-                }
-            }
-        }
-
-        // Log authenticated peer joins/leaves (by address) privately, and periodic AGGREGATE stats
-        // publicly. services-03: a per-peer address join/leave is correlatable traffic metadata, so
-        // it goes only to Cloud Logging; the public stream sees just the peers=N counter below.
-        let cur: std::collections::HashSet<Vec<u8>> =
-            node.peers().iter().map(|a| a.to_vec()).collect();
-        for p in cur.difference(&prev_peers) {
-            netlog_private(format!("peer connected: {}", short_b58(p)));
-        }
-        for p in prev_peers.difference(&cur) {
-            netlog_private(format!("peer left: {}", short_b58(p)));
-        }
-        prev_peers = cur;
-        let now = now_ms();
-        if now.saturating_sub(last_stats_ms) >= 10_000 {
-            last_stats_ms = now;
-            netlog(format!(
-                "stats: peers={} held={}",
-                node.peers().len(),
-                node.queue().len()
-            ));
         }
 
         // Feed the handoff worker a fresh snapshot of who's connected and what we can't
@@ -1321,33 +1466,18 @@ mod backbone {
     }
 }
 
-/// Cross-partition handoff (DESIGN.md §28): the offline-destination mailbox.
-///
-/// Each region's relay owns a Firestore partition. When a relay holds a device-addressed
-/// bundle it can't deliver locally, it looks up where that device last checked in
-/// (presence) and writes the bundle into *that region's* partition — the destination
-/// region then delivers it on its next device check-in (cold start rehydrates; a warm
-/// node ingests via the reload loop below). Presence is recorded for connected device
-/// peers (a peer relay, identified via the registry, is skipped). All blocking Firestore
-/// I/O runs here, off the single-owner driver thread.
-#[cfg(feature = "firestore")]
-mod handoff {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::mpsc::{self, Sender};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+/// The durable blind-spool mailbox logic (§39 P5) plus the dedup-map age-eviction (services-r2-04),
+/// kept store-agnostic and free of any Firestore dependency so it compiles and is unit-tested in the
+/// default build (not only when `--features firestore` is on). The concrete `MailboxStore` impl for
+/// the Firestore `Presence` and the worker that drives this live in the firestore-gated `handoff`
+/// module below.
+#[cfg_attr(not(feature = "firestore"), allow(dead_code))]
+mod mailbox {
+    use std::collections::HashMap;
 
     use hop_core::bundle::BundleId;
-    use hop_core::crypto::{PubKeyBytes, Tag};
-    use hop_store_firestore::Presence;
+    use hop_core::crypto::Tag;
 
-    use super::{now_ms, region_node_b58, Ev};
-
-    /// A device-presence record is trusted this long after check-in (matches the
-    /// registry TTL — beyond it, we don't know where the device is, so we don't hand off).
-    const PRESENCE_TTL_MS: u64 = 90_000;
-    /// How often a warm node re-reads its own partition for handoffs others wrote.
-    const RELOAD_SECS: u64 = 30;
     /// services-r2-04: hard fallback cap on a dedup map. Age eviction (drop expired entries) is the
     /// primary bound; this only triggers if a pathological set of all-far-future entries piles up,
     /// evicting the nearest-to-expiry so memory stays bounded WITHOUT a wholesale clear() that would
@@ -1377,6 +1507,269 @@ mod handoff {
             }
         }
     }
+
+    /// The durable blind-spool mailbox operations the §39 P5 worker needs (F-18). Abstracting these
+    /// out of the concrete Firestore `Presence` makes the cross-region spool→pull round trip testable
+    /// with an in-memory fake that two "regions" share.
+    pub trait MailboxStore {
+        fn spool_to_mailbox(
+            &self,
+            tag_b58: &str,
+            id: &BundleId,
+            data: &[u8],
+            expires_at: u64,
+        ) -> Result<(), String>;
+        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String>;
+        fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
+    }
+
+    /// §39 P5 spool + want-beacon, store-agnostic. Spools each un-routable private bundle by its
+    /// mailbox-tag; for each wanted tag, pulls anything held under it, dedups by id, deletes the
+    /// spool copy, and returns the bytes to re-ingest. `spooled`/`pulled` carry cross-cycle dedup.
+    pub fn process_mailbox<M: MailboxStore>(
+        store: &M,
+        spool: &[(BundleId, Tag, Vec<u8>, u64)],
+        wanted: &[Tag],
+        spooled: &mut HashMap<(BundleId, Tag), u64>,
+        pulled: &mut HashMap<BundleId, u64>,
+    ) -> Vec<Vec<u8>> {
+        for (id, tag, bytes, expires) in spool {
+            // services-r2-04: dedup value is the bundle's own expiry, so the caller can age-evict.
+            if spooled.insert((*id, *tag), *expires).is_some() {
+                continue; // already spooled this cycle-set
+            }
+            let tag_b58 = bs58::encode(tag).into_string();
+            if let Err(e) = store.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
+                // services-03: bundle id + mailbox-tag prefix is exactly the spool/pull correlation
+                // pair §39 must not leak to the public; operator log (Cloud Logging) only.
+                super::netlog_private(format!(
+                    "spool FAILED: msg {} → mailbox {}: {e}",
+                    super::short_b58(id),
+                    &tag_b58[..tag_b58.len().min(8)]
+                ));
+                spooled.remove(&(*id, *tag)); // let a later cycle retry
+            } else {
+                super::netlog_private(format!(
+                    "spool: msg {} → mailbox {}",
+                    super::short_b58(id),
+                    &tag_b58[..tag_b58.len().min(8)]
+                ));
+            }
+        }
+
+        let mut ingest = Vec::new();
+        for tag in wanted {
+            let tag_b58 = bs58::encode(tag).into_string();
+            let held = match store.list_mailbox(&tag_b58) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("spool: list_mailbox failed: {e}");
+                    continue;
+                }
+            };
+            for (bytes, expires) in held {
+                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
+                    continue;
+                };
+                let id = b.id();
+                if pulled.insert(id, expires).is_none() {
+                    // services-03: pull side of the spool/pull correlation; operator log only.
+                    super::netlog_private(format!(
+                        "want-beacon: pulled msg {} from mailbox {}",
+                        super::short_b58(&id),
+                        &tag_b58[..tag_b58.len().min(8)]
+                    ));
+                    ingest.push(bytes);
+                }
+                let _ = store.delete_mailbox_bundle(&tag_b58, &id);
+            }
+        }
+        ingest
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hop_core::crypto::PubKeyBytes;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// One shared in-memory Firestore-like mailbox store; two `RegionWorker`s over the SAME
+        /// instance simulate region A spooling and region B pulling (the cross-region path).
+        #[derive(Default)]
+        struct FakeMailbox {
+            // tag_b58 → (bundle-id → bytes)
+            boxes: Mutex<HashMap<String, HashMap<BundleId, Vec<u8>>>>,
+        }
+        impl MailboxStore for FakeMailbox {
+            fn spool_to_mailbox(
+                &self,
+                tag_b58: &str,
+                id: &BundleId,
+                data: &[u8],
+                _e: u64,
+            ) -> Result<(), String> {
+                self.boxes
+                    .lock()
+                    .unwrap()
+                    .entry(tag_b58.to_string())
+                    .or_default()
+                    .insert(*id, data.to_vec());
+                Ok(())
+            }
+            fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
+                Ok(self
+                    .boxes
+                    .lock()
+                    .unwrap()
+                    .get(tag_b58)
+                    .map(|m| m.values().map(|v| (v.clone(), 0)).collect())
+                    .unwrap_or_default())
+            }
+            fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
+                if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) {
+                    m.remove(id);
+                }
+                Ok(())
+            }
+        }
+
+        fn private_bundle_for(
+            spk_pub: &hop_core::crypto::XPubKeyBytes,
+            seal_to: &PubKeyBytes,
+        ) -> (BundleId, Tag, Vec<u8>) {
+            use hop_core::bundle::{Bundle, BundleOpts, Payload};
+            use hop_core::crypto::{
+                mailbox_route, mailbox_tag, MAILBOX_ROUTE_PREFIX_BYTES, TAG_LEN,
+            };
+            // F-06 / core-protocol-r2-02: the recipient's mailbox tag (address + epoch 0) is projected
+            // to its 2-byte ROUTING PREFIX; the private header now carries only that prefix (never the
+            // full tag), so the relay's spool key is an anonymity set, not a per-recipient address.
+            let route = mailbox_route(&mailbox_tag(seal_to, 0));
+            let b = Bundle::create_private(
+                seal_to,
+                spk_pub,
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b"cross-region".to_vec(),
+                },
+                Some(route),
+                BundleOpts::default(),
+            )
+            .unwrap();
+            // The relay spools/pulls under the route-key: the 2-byte prefix right-padded into a full
+            // Tag (matching the driver's spoolable_private_bundles / take_wanted_mailboxes keys).
+            let mut spool_key = [0u8; TAG_LEN];
+            spool_key[..MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(&route);
+            (b.id(), spool_key, b.to_bytes().unwrap())
+        }
+
+        #[test]
+        fn cross_region_spool_then_want_beacon_pulls_exactly_once() {
+            use hop_core::prelude::Identity;
+            let store = FakeMailbox::default();
+            let bob = Identity::generate();
+            let spk = bob.derive_prekey();
+            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
+
+            // Region A: no live gradient → spool the bundle. Its own dedup sets.
+            let (mut sp_a, mut pl_a) = (HashMap::new(), HashMap::new());
+            let out_a = process_mailbox(
+                &store,
+                &[(id, tag, bytes.clone(), 0)],
+                &[],
+                &mut sp_a,
+                &mut pl_a,
+            );
+            assert!(out_a.is_empty(), "spooling ingests nothing");
+            assert_eq!(
+                store
+                    .list_mailbox(&bs58::encode(tag).into_string())
+                    .unwrap()
+                    .len(),
+                1,
+                "bundle is durably spooled by mailbox-tag"
+            );
+
+            // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
+            let (mut sp_b, mut pl_b) = (HashMap::new(), HashMap::new());
+            let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
+            assert_eq!(
+                out_b.len(),
+                1,
+                "want-beacon in region B pulls the bundle spooled in region A"
+            );
+            assert_eq!(
+                hop_core::bundle::Bundle::from_bytes(&out_b[0])
+                    .unwrap()
+                    .id(),
+                id,
+                "pulled the right bundle"
+            );
+
+            // Exactly once: the spool copy is deleted, so a re-beacon (even a fresh worker) pulls nothing.
+            assert!(
+                store
+                    .list_mailbox(&bs58::encode(tag).into_string())
+                    .unwrap()
+                    .is_empty(),
+                "spool copy deleted after pull"
+            );
+            let (mut sp_c, mut pl_c) = (HashMap::new(), HashMap::new());
+            assert!(
+                process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
+                "no double-delivery on re-beacon"
+            );
+        }
+
+        #[test]
+        fn same_worker_pull_dedups_within_its_pulled_set() {
+            use hop_core::prelude::Identity;
+            let store = FakeMailbox::default();
+            let bob = Identity::generate();
+            let spk = bob.derive_prekey();
+            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
+            let (mut sp, mut pl) = (HashMap::new(), HashMap::new());
+            process_mailbox(&store, &[(id, tag, bytes, 0)], &[], &mut sp, &mut pl);
+            // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
+            let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
+            let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
+            assert!(
+                again.is_empty(),
+                "a bundle id already pulled by this worker is not re-ingested"
+            );
+        }
+    }
+}
+
+/// Cross-partition handoff (DESIGN.md §28): the offline-destination mailbox.
+///
+/// Each region's relay owns a Firestore partition. When a relay holds a device-addressed
+/// bundle it can't deliver locally, it looks up where that device last checked in
+/// (presence) and writes the bundle into *that region's* partition — the destination
+/// region then delivers it on its next device check-in (cold start rehydrates; a warm
+/// node ingests via the reload loop below). Presence is recorded for connected device
+/// peers (a peer relay, identified via the registry, is skipped). All blocking Firestore
+/// I/O runs here, off the single-owner driver thread.
+#[cfg(feature = "firestore")]
+mod handoff {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use hop_core::bundle::BundleId;
+    use hop_core::crypto::{PubKeyBytes, Tag};
+    use hop_store_firestore::Presence;
+
+    use super::mailbox::{evict_expired, process_mailbox, MailboxStore};
+    use super::{now_ms, region_node_b58, Ev};
+
+    /// A device-presence record is trusted this long after check-in (matches the
+    /// registry TTL — beyond it, we don't know where the device is, so we don't hand off).
+    const PRESENCE_TTL_MS: u64 = 90_000;
+    /// How often a warm node re-reads its own partition for handoffs others wrote.
+    const RELOAD_SECS: u64 = 30;
 
     /// What the driver tells the worker each cycle: who's connected, and what we hold
     /// that we can't deliver locally.
@@ -1529,21 +1922,8 @@ mod handoff {
         snap_tx
     }
 
-    /// The durable blind-spool mailbox operations the §39 P5 worker needs (F-18). Abstracting these
-    /// out of the concrete Firestore [`Presence`] makes the cross-region spool→pull round trip
-    /// testable with an in-memory fake that two "regions" share.
-    pub trait MailboxStore {
-        fn spool_to_mailbox(
-            &self,
-            tag_b58: &str,
-            id: &BundleId,
-            data: &[u8],
-            expires_at: u64,
-        ) -> Result<(), String>;
-        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String>;
-        fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
-    }
-
+    /// The Firestore `Presence` is the production [`MailboxStore`] (the in-memory fake in the mailbox
+    /// module's tests is the other impl); this just forwards each trait method to the inherent one.
     impl MailboxStore for Presence {
         fn spool_to_mailbox(
             &self,
@@ -1559,223 +1939,6 @@ mod handoff {
         }
         fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
             Presence::delete_mailbox_bundle(self, tag_b58, id)
-        }
-    }
-
-    /// §39 P5 spool + want-beacon, store-agnostic. Spools each un-routable private bundle by its
-    /// mailbox-tag; for each wanted tag, pulls anything held under it, dedups by id, deletes the
-    /// spool copy, and returns the bytes to re-ingest. `spooled`/`pulled` carry cross-cycle dedup.
-    pub fn process_mailbox<M: MailboxStore>(
-        store: &M,
-        spool: &[(BundleId, Tag, Vec<u8>, u64)],
-        wanted: &[Tag],
-        spooled: &mut HashMap<(BundleId, Tag), u64>,
-        pulled: &mut HashMap<BundleId, u64>,
-    ) -> Vec<Vec<u8>> {
-        for (id, tag, bytes, expires) in spool {
-            // services-r2-04: dedup value is the bundle's own expiry, so the caller can age-evict.
-            if spooled.insert((*id, *tag), *expires).is_some() {
-                continue; // already spooled this cycle-set
-            }
-            let tag_b58 = bs58::encode(tag).into_string();
-            if let Err(e) = store.spool_to_mailbox(&tag_b58, id, bytes, *expires) {
-                // services-03: bundle id + mailbox-tag prefix is exactly the spool/pull correlation
-                // pair §39 must not leak to the public; operator log (Cloud Logging) only.
-                super::netlog_private(format!(
-                    "spool FAILED: msg {} → mailbox {}: {e}",
-                    super::short_b58(id),
-                    &tag_b58[..tag_b58.len().min(8)]
-                ));
-                spooled.remove(&(*id, *tag)); // let a later cycle retry
-            } else {
-                super::netlog_private(format!(
-                    "spool: msg {} → mailbox {}",
-                    super::short_b58(id),
-                    &tag_b58[..tag_b58.len().min(8)]
-                ));
-            }
-        }
-
-        let mut ingest = Vec::new();
-        for tag in wanted {
-            let tag_b58 = bs58::encode(tag).into_string();
-            let held = match store.list_mailbox(&tag_b58) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("spool: list_mailbox failed: {e}");
-                    continue;
-                }
-            };
-            for (bytes, expires) in held {
-                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
-                    continue;
-                };
-                let id = b.id();
-                if pulled.insert(id, expires).is_none() {
-                    // services-03: pull side of the spool/pull correlation; operator log only.
-                    super::netlog_private(format!(
-                        "want-beacon: pulled msg {} from mailbox {}",
-                        super::short_b58(&id),
-                        &tag_b58[..tag_b58.len().min(8)]
-                    ));
-                    ingest.push(bytes);
-                }
-                let _ = store.delete_mailbox_bundle(&tag_b58, &id);
-            }
-        }
-        ingest
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-
-        /// One shared in-memory Firestore-like mailbox store; two `RegionWorker`s over the SAME
-        /// instance simulate region A spooling and region B pulling (the cross-region path).
-        #[derive(Default)]
-        struct FakeMailbox {
-            // tag_b58 → (bundle-id → bytes)
-            boxes: Mutex<HashMap<String, HashMap<BundleId, Vec<u8>>>>,
-        }
-        impl MailboxStore for FakeMailbox {
-            fn spool_to_mailbox(
-                &self,
-                tag_b58: &str,
-                id: &BundleId,
-                data: &[u8],
-                _e: u64,
-            ) -> Result<(), String> {
-                self.boxes
-                    .lock()
-                    .unwrap()
-                    .entry(tag_b58.to_string())
-                    .or_default()
-                    .insert(*id, data.to_vec());
-                Ok(())
-            }
-            fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-                Ok(self
-                    .boxes
-                    .lock()
-                    .unwrap()
-                    .get(tag_b58)
-                    .map(|m| m.values().map(|v| (v.clone(), 0)).collect())
-                    .unwrap_or_default())
-            }
-            fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
-                if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) {
-                    m.remove(id);
-                }
-                Ok(())
-            }
-        }
-
-        fn private_bundle_for(
-            spk_pub: &hop_core::crypto::XPubKeyBytes,
-            seal_to: &PubKeyBytes,
-        ) -> (BundleId, Tag, Vec<u8>) {
-            use hop_core::bundle::{Bundle, BundleOpts, Payload};
-            use hop_core::crypto::{
-                mailbox_route, mailbox_tag, MAILBOX_ROUTE_PREFIX_BYTES, TAG_LEN,
-            };
-            // F-06 / core-protocol-r2-02: the recipient's mailbox tag (address + epoch 0) is projected
-            // to its 2-byte ROUTING PREFIX; the private header now carries only that prefix (never the
-            // full tag), so the relay's spool key is an anonymity set, not a per-recipient address.
-            let route = mailbox_route(&mailbox_tag(seal_to, 0));
-            let b = Bundle::create_private(
-                seal_to,
-                spk_pub,
-                &Payload::PeerMessage {
-                    content_type: "t".into(),
-                    body: b"cross-region".to_vec(),
-                },
-                Some(route),
-                BundleOpts::default(),
-            )
-            .unwrap();
-            // The relay spools/pulls under the route-key: the 2-byte prefix right-padded into a full
-            // Tag (matching the driver's spoolable_private_bundles / take_wanted_mailboxes keys).
-            let mut spool_key = [0u8; TAG_LEN];
-            spool_key[..MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(&route);
-            (b.id(), spool_key, b.to_bytes().unwrap())
-        }
-
-        #[test]
-        fn cross_region_spool_then_want_beacon_pulls_exactly_once() {
-            use hop_core::prelude::Identity;
-            let store = FakeMailbox::default();
-            let bob = Identity::generate();
-            let spk = bob.derive_prekey();
-            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
-
-            // Region A: no live gradient → spool the bundle. Its own dedup sets.
-            let (mut sp_a, mut pl_a) = (HashMap::new(), HashMap::new());
-            let out_a = process_mailbox(
-                &store,
-                &[(id, tag, bytes.clone(), 0)],
-                &[],
-                &mut sp_a,
-                &mut pl_a,
-            );
-            assert!(out_a.is_empty(), "spooling ingests nothing");
-            assert_eq!(
-                store
-                    .list_mailbox(&bs58::encode(tag).into_string())
-                    .unwrap()
-                    .len(),
-                1,
-                "bundle is durably spooled by mailbox-tag"
-            );
-
-            // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
-            let (mut sp_b, mut pl_b) = (HashMap::new(), HashMap::new());
-            let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
-            assert_eq!(
-                out_b.len(),
-                1,
-                "want-beacon in region B pulls the bundle spooled in region A"
-            );
-            assert_eq!(
-                hop_core::bundle::Bundle::from_bytes(&out_b[0])
-                    .unwrap()
-                    .id(),
-                id,
-                "pulled the right bundle"
-            );
-
-            // Exactly once: the spool copy is deleted, so a re-beacon (even a fresh worker) pulls nothing.
-            assert!(
-                store
-                    .list_mailbox(&bs58::encode(tag).into_string())
-                    .unwrap()
-                    .is_empty(),
-                "spool copy deleted after pull"
-            );
-            let (mut sp_c, mut pl_c) = (HashMap::new(), HashMap::new());
-            assert!(
-                process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
-                "no double-delivery on re-beacon"
-            );
-        }
-
-        #[test]
-        fn same_worker_pull_dedups_within_its_pulled_set() {
-            use hop_core::prelude::Identity;
-            let store = FakeMailbox::default();
-            let bob = Identity::generate();
-            let spk = bob.derive_prekey();
-            let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
-            let (mut sp, mut pl) = (HashMap::new(), HashMap::new());
-            process_mailbox(&store, &[(id, tag, bytes, 0)], &[], &mut sp, &mut pl);
-            // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
-            let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
-            let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
-            assert!(
-                again.is_empty(),
-                "a bundle id already pulled by this worker is not re-ingested"
-            );
         }
     }
 }
@@ -1882,6 +2045,31 @@ mod log_privacy_tests {
         );
         // Sanity: netlog is the public path (compiles + routes through emit).
         netlog("relay up: region=test");
+    }
+
+    #[test]
+    fn ring_is_capped_at_400_and_public_subscribe_returns_the_backlog() {
+        // The public-safe ring is bounded (oldest lines drop past 400) so a long-lived relay's hub
+        // can't grow without bound; and with the public stream ON, a new viewer's subscribe() returns
+        // that capped ring as its backlog (services-03). Serialize on the env lock (subscribe reads
+        // the global HOP_PUBLIC_LOG_STREAM flag).
+        let _env = super::PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        let hub = fresh_hub();
+        for i in 0..450 {
+            hub.emit(format!("line {i}"));
+        }
+        std::env::set_var("HOP_PUBLIC_LOG_STREAM", "1");
+        let (_who, backlog, _rx) = hub.subscribe();
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        assert_eq!(backlog.len(), 400, "the ring is capped at 400 lines");
+        assert!(
+            backlog.last().unwrap().contains("line 449"),
+            "the newest line is retained"
+        );
+        assert!(
+            backlog.iter().all(|l| !l.contains("line 0 ")),
+            "the oldest lines were evicted"
+        );
     }
 }
 
@@ -2325,13 +2513,225 @@ mod control_path_tests {
             "no leaked mesh slots"
         );
     }
+
+    #[test]
+    fn spawn_tcp_conn_admits_a_connection_and_releases_its_slot_on_close() {
+        // The raw-TCP accept-loop body: admit a mesh slot and bridge the socket to serve_tcp (an Up
+        // event reaches the driver). When the peer disconnects, serve_tcp returns and the slot guard
+        // drops, releasing the mesh slot (no leak on a normal disconnect).
+        use super::{spawn_tcp_conn, Ev, ACTIVE_CONNS};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), 0, "clean start");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (sock, _) = listener.accept().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        spawn_tcp_conn(sock, &ev_tx);
+        let up = ev_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("link up");
+        assert!(
+            matches!(up, Ev::Up(_, super::Role::Responder, _)),
+            "spawn_tcp_conn admits and bridges an Up event"
+        );
+        drop(client); // disconnect: serve_tcp returns and the guard releases the slot
+        let start = std::time::Instant::now();
+        while ACTIVE_CONNS.load(Ordering::SeqCst) != 0
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "the mesh slot is released when the connection closes"
+        );
+    }
+
+    #[test]
+    fn dispatch_ws_accept_fast_paths_healthz_and_admits_a_real_upgrade() {
+        // The WS accept-loop body. (a) A buffered `GET /healthz` is served EXEMPT from every budget on
+        // its own thread (no mesh/pending slot charged). (b) A real WS upgrade is admitted via the
+        // pending budget and bridged to the driver as a mesh link (an Up event arrives), then its slot
+        // is released when the link closes.
+        use super::{dispatch_ws_accept, Ev, ACTIVE_CONNS, ACTIVE_WS_PENDING};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+
+        // (a) healthz fast-path: an HTTP response comes back and no slot is charged.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            let mut sink = Vec::new();
+            let _ = c.read_to_end(&mut sink);
+            sink
+        });
+        let (sock, _) = listener.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25)); // let the probe's bytes arrive
+        let (ev_tx, _ev_rx) = mpsc::channel::<Ev>();
+        dispatch_ws_accept(sock, &ev_tx);
+        let resp = probe.join().unwrap();
+        assert!(
+            resp.windows(4).any(|w| w == b"HTTP"),
+            "healthz was served an HTTP response"
+        );
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "healthz charged no mesh slot"
+        );
+        assert_eq!(
+            ACTIVE_WS_PENDING.load(Ordering::SeqCst),
+            0,
+            "healthz charged no pending slot"
+        );
+
+        // (b) a real WS upgrade: admitted (pending budget) and bridged as a mesh link.
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let stream = TcpStream::connect(addr2).unwrap();
+            let (mut ws, _r) =
+                tungstenite::client(format!("ws://127.0.0.1:{}/", addr2.port()), stream).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80)); // hold the link, then close
+            let _ = ws.close(None);
+            let _ = ws.flush();
+        });
+        let (sock2, _) = listener2.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (ev_tx2, ev_rx2) = mpsc::channel::<Ev>();
+        dispatch_ws_accept(sock2, &ev_tx2);
+        let up = ev_rx2
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("upgrade link up");
+        assert!(
+            matches!(up, Ev::Up(_, super::Role::Responder, _)),
+            "a real WS upgrade is admitted and bridged as a mesh link"
+        );
+        client.join().unwrap();
+        let start = std::time::Instant::now();
+        while ACTIVE_CONNS.load(Ordering::SeqCst) != 0
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "the mesh slot is released when the upgrade link closes"
+        );
+    }
+
+    #[test]
+    fn admit_and_serve_ws_sheds_an_upgrade_and_a_log_viewer_when_their_pools_are_full() {
+        // The pool-full shed branches of admit_and_serve_ws: with the mesh pool saturated a real WS
+        // upgrade is shed on the mesh budget (no Ev::Up reaches the driver); with the log pool
+        // saturated a plain GET (log viewer) is shed on the log budget. Neither leaks a slot.
+        use super::{
+            admit_and_serve_ws, admit_conn, admit_log_conn, admit_ws_pending, Ev, ACTIVE_CONNS,
+            ACTIVE_LOG_CONNS, MAX_CONNS, MAX_LOG_CONNS,
+        };
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        let _lock = CONN_TEST_LOCK.lock().unwrap();
+
+        // Send `req`, run admit_and_serve_ws on the accepted socket, and report whether it produced an
+        // Ev::Up (i.e. was admitted rather than shed). Raw bytes (no tungstenite handshake) so a shed
+        // that drops the socket never blocks the client.
+        fn produced_up(req: &[u8]) -> bool {
+            let pending = admit_ws_pending().expect("pending slot");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let req = req.to_vec();
+            let client = std::thread::spawn(move || {
+                let mut c = TcpStream::connect(addr).unwrap();
+                let _ = c.write_all(&req);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            });
+            let (sock, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // let the request bytes arrive
+            let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+            std::thread::spawn(move || admit_and_serve_ws(sock, pending, &ev_tx))
+                .join()
+                .unwrap();
+            client.join().unwrap();
+            matches!(
+                ev_rx.recv_timeout(std::time::Duration::from_millis(200)),
+                Ok(Ev::Up(..))
+            )
+        }
+
+        // Mesh pool saturated: a real upgrade is shed (no Up), leaving the mesh count unchanged.
+        let mut mesh: Vec<_> = (0..MAX_CONNS).map(|_| admit_conn().unwrap()).collect();
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            MAX_CONNS,
+            "mesh saturated"
+        );
+        assert!(
+            !produced_up(
+                b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+            "a WS upgrade is shed when the mesh pool is full"
+        );
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            MAX_CONNS,
+            "the shed did not charge (or leak) a mesh slot"
+        );
+        mesh.clear();
+
+        // Log pool saturated: a plain GET (a log viewer) is shed on the log budget.
+        let mut logs: Vec<_> = (0..MAX_LOG_CONNS)
+            .map(|_| admit_log_conn().unwrap())
+            .collect();
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            MAX_LOG_CONNS,
+            "log pool saturated"
+        );
+        assert!(
+            !produced_up(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            "a log viewer never produces an Up (and here it is shed on a full log pool)"
+        );
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            MAX_LOG_CONNS,
+            "the shed did not charge (or leak) a log slot"
+        );
+        logs.clear();
+        assert_eq!(
+            ACTIVE_CONNS.load(Ordering::SeqCst),
+            0,
+            "no leaked mesh slots"
+        );
+        assert_eq!(
+            ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
+            0,
+            "no leaked log slots"
+        );
+    }
 }
 
-#[cfg(all(test, feature = "firestore"))]
+#[cfg(test)]
 mod handoff_dedup_tests {
     // services-r2-04: age-based eviction of the handoff/spool dedup maps, replacing the wholesale
     // clear() that let already-handed bundles be redundantly re-written to Firestore after a reset.
-    use super::handoff::evict_expired;
+    // The helper now lives in the always-compiled `mailbox` module, so this runs in the default
+    // build (not only under --features firestore).
+    use super::mailbox::evict_expired;
     use std::collections::HashMap;
 
     #[test]
@@ -2610,6 +3010,43 @@ mod identity_tests {
         );
         let _ = std::fs::remove_file(&key);
     }
+
+    #[test]
+    fn load_identity_panics_on_an_unreadable_identity_file() {
+        // A mounted secret that can't be read (missing/permission-denied) must FAIL LOUDLY rather than
+        // fall back to a throwaway identity, which would give the relay a wrong/unstable address.
+        let missing = format!(
+            "{}/hop-relayd-does-not-exist-{}-{}.key",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            NEXT_LINK.fetch_add(1, Ordering::Relaxed)
+        );
+        let _ = std::fs::remove_file(&missing);
+        let r = std::panic::catch_unwind(|| load_identity(&Some(missing.clone()), "unused.key"));
+        assert!(
+            r.is_err(),
+            "an unreadable --identity-file must panic, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn load_identity_generates_and_warns_when_the_seed_cannot_be_persisted() {
+        // No --identity-file and a key_path whose parent directory does not exist: the read fails, so a
+        // fresh identity is generated; persisting it fails (no such dir), which must warn loudly but
+        // still return a usable identity (the relay comes up, just with a warned-about unstable seed).
+        let unwritable = format!(
+            "/hop-relayd-no-such-dir-{}-{}/seed.key",
+            std::process::id(),
+            NEXT_LINK.fetch_add(1, Ordering::Relaxed)
+        );
+        let id = load_identity(&None, &unwritable);
+        // A real identity is returned (address derivable) despite the failed persist.
+        assert_eq!(id.address().len(), Identity::generate().address().len());
+        assert!(
+            std::fs::metadata(&unwritable).is_err(),
+            "the seed was NOT persisted (the parent dir does not exist)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2617,12 +3054,36 @@ mod healthz_tests {
     use super::*;
     use std::net::TcpStream;
 
-    // serve_healthz reads the process-global LAST_TICK_MS; serialize so tests don't race the value.
-    // Recover from poisoning so a single failing assertion reports ITS failure rather than
-    // cascading a PoisonError across the other healthz tests (which would obscure the real break).
-    static HEALTHZ_LOCK: Mutex<()> = Mutex::new(());
-    fn lock_healthz() -> std::sync::MutexGuard<'static, ()> {
-        HEALTHZ_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    // serve_healthz reads the process-global LAST_TICK_MS; serialize on the shared driver-statics
+    // lock (also held by the driver-loop / shutdown tests) so no test observes another's transient
+    // tick value. Recover from poisoning so a single failing assertion reports ITS failure rather
+    // than cascading a PoisonError across the other tests.
+    use super::lock_driver_statics as lock_healthz;
+
+    #[test]
+    fn healthz_status_reports_stale_degraded_and_healthy() {
+        // The pure decision behind serve_healthz. Before the first tick (last=0) => 503 stale; a fresh
+        // tick with dropped mirror writes => 200 but "degraded"; a fresh tick with no drops => plain
+        // 200 "ok"; and a tick older than the stale window => 503 stale (restart the wedged instance).
+        assert_eq!(
+            healthz_status(0, 1_000_000, 0),
+            ("503 Service Unavailable", "stale".to_string())
+        );
+        let (s, b) = healthz_status(1_000_000, 1_000_500, 7);
+        assert_eq!(s, "200 OK");
+        assert_eq!(
+            b, "ok degraded: mirror_dropped=7",
+            "a dropping mirror is reported, still 200"
+        );
+        assert_eq!(
+            healthz_status(1_000_000, 1_000_500, 0),
+            ("200 OK", "ok".to_string())
+        );
+        assert_eq!(
+            healthz_status(1_000_000, 1_000_000 + HEALTHZ_STALE_MS + 1, 0),
+            ("503 Service Unavailable", "stale".to_string()),
+            "a tick older than the stale window is a restart-worthy 503"
+        );
     }
 
     /// Drive serve_healthz over a real loopback socket and return the raw HTTP response.
@@ -2828,5 +3289,731 @@ mod tcp_framing_tests {
             matches!(evs.last(), Some(Ev::Down(_))),
             "the connection is dropped (link-down) on an over-cap frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn bare_invocation_defaults_to_the_path_a_tcp_bearer() {
+        // A bare `hop-relayd` (no --listen/--ws) must keep listening on TCP 9443 (path A), or a plain
+        // VM invocation would come up with no bearer at all.
+        let c = parse_args(args(&[]));
+        assert_eq!(
+            c.listen.as_deref(),
+            Some("0.0.0.0:9443"),
+            "no bearer flags => TCP 9443 default"
+        );
+        assert!(c.ws.is_none());
+        assert_eq!(c.db, "hop-relay.db");
+        assert_eq!(c.mesh_fanout, 0);
+        assert!(c.peers.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_ws_suppresses_the_tcp_default() {
+        // If the operator picks --ws (the Cloud Run path), the bare-invocation TCP fallback must NOT
+        // also fire, or the daemon would bind an unwanted 9443 as well.
+        let c = parse_args(args(&["--ws", "0.0.0.0:8080"]));
+        assert_eq!(c.ws.as_deref(), Some("0.0.0.0:8080"));
+        assert!(c.listen.is_none(), "an explicit --ws leaves --listen unset");
+    }
+
+    #[test]
+    fn every_flag_parses_and_repeated_peer_accumulates() {
+        let c = parse_args(args(&[
+            "--listen",
+            "1.2.3.4:1",
+            "--ws",
+            "5.6.7.8:2",
+            "--db",
+            "/tmp/x.db",
+            "--identity-file",
+            "/k",
+            "--firestore",
+            "proj",
+            "--region",
+            "us",
+            "--advertise",
+            "wss://us.relay/",
+            "--mesh-fanout",
+            "3",
+            "--peer",
+            "a:1",
+            "--peer",
+            "b:2",
+        ]));
+        assert_eq!(c.listen.as_deref(), Some("1.2.3.4:1"));
+        assert_eq!(c.ws.as_deref(), Some("5.6.7.8:2"));
+        assert_eq!(c.db, "/tmp/x.db");
+        assert_eq!(c.identity_file.as_deref(), Some("/k"));
+        assert_eq!(c.firestore.as_deref(), Some("proj"));
+        assert_eq!(c.region.as_deref(), Some("us"));
+        assert_eq!(c.advertise.as_deref(), Some("wss://us.relay/"));
+        assert_eq!(c.mesh_fanout, 3);
+        assert_eq!(c.peers, vec!["a:1".to_string(), "b:2".to_string()]);
+    }
+
+    #[test]
+    fn a_bad_mesh_fanout_is_zero_and_unknown_flags_are_ignored() {
+        // An unparseable --mesh-fanout must fall back to 0 (off), not panic; and an unknown flag is
+        // skipped so parsing continues to the flags after it.
+        let c = parse_args(args(&[
+            "--mesh-fanout",
+            "notanumber",
+            "--bogus",
+            "--listen",
+            "x:9",
+        ]));
+        assert_eq!(c.mesh_fanout, 0, "unparseable fan-out => 0 (off)");
+        assert_eq!(
+            c.listen.as_deref(),
+            Some("x:9"),
+            "parsing continues past an unknown flag"
+        );
+    }
+}
+
+#[cfg(test)]
+mod node_setup_tests {
+    use super::*;
+
+    #[test]
+    fn regional_identity_derives_per_region_and_passes_through_without_a_region() {
+        // §27/§28: with --region the node runs a distinct per-region backbone identity derived from
+        // the shared seed (matching region_seed); with no region the base identity is used unchanged.
+        let base = Identity::generate();
+        let base_addr = base.address();
+        let seed = base.to_secret_bytes();
+
+        let passthrough = regional_identity(base, &seed, None);
+        assert_eq!(
+            passthrough.address(),
+            base_addr,
+            "no --region keeps the base identity"
+        );
+
+        let base2 = Identity::from_secret_bytes(&seed);
+        let regional = regional_identity(base2, &seed, Some("us-central1"));
+        assert_eq!(
+            regional.address(),
+            Identity::from_secret_bytes(&region_seed(&seed, "us-central1")).address(),
+            "the regional identity is exactly the one derived from region_seed"
+        );
+        assert_ne!(
+            regional.address(),
+            base_addr,
+            "a per-region node is a distinct node from the base"
+        );
+    }
+
+    #[test]
+    fn configure_node_sets_the_identify_name_from_the_advertise_host() {
+        // §29: a relay identifies itself by the host of its --advertise URL, so a trace shows it by
+        // domain. Without --advertise the name stays unset (callers fall back to the short address).
+        let mut node = Node::with_store(Identity::generate(), MemoryStore::new());
+        configure_node(&mut node, Some("wss://eu-west1.relay.hopme.sh/"));
+        assert_eq!(
+            node.name(),
+            Some("eu-west1.relay.hopme.sh"),
+            "identify name is the advertise host"
+        );
+
+        let mut node2 = Node::with_store(Identity::generate(), MemoryStore::new());
+        configure_node(&mut node2, None);
+        assert_eq!(node2.name(), None, "no --advertise => no identify name");
+    }
+
+    #[test]
+    fn announce_startup_seeds_the_live_log_identity_with_region_and_address() {
+        // announce_startup stamps the global log hub's identity (which the log stream leads with) so a
+        // visitor to the anycast name sees which region + node answered. Assert a fresh subscriber
+        // reads back that identity string (region-tagged; a unique region avoids racing other tests).
+        let addr = Identity::generate().address();
+        announce_startup(
+            Some("0.0.0.0:9443"),
+            None,
+            2,
+            &addr,
+            Some("announce-test-region"),
+        );
+        let (who, _backlog, _rx) = log_hub().subscribe();
+        assert!(
+            who.contains("region=announce-test-region"),
+            "log identity carries the region: {who}"
+        );
+        assert!(
+            who.contains(&bs58_addr(&addr)),
+            "log identity carries the node address: {who}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn test_node() -> Node<MemoryStore> {
+        Node::with_store(Identity::generate(), MemoryStore::new())
+    }
+
+    #[test]
+    fn apply_event_tracks_the_writer_table_across_up_data_down() {
+        let mut node = test_node();
+        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let (out_tx, _out_rx) = mpsc::channel();
+        apply_event(&mut node, &mut writers, Ev::Up(7, Role::Responder, out_tx));
+        assert!(writers.contains_key(&7), "Up registers the link's writer");
+        // Garbage link bytes are tolerated (the node just fails to parse a frame); the table is intact.
+        apply_event(&mut node, &mut writers, Ev::Data(7, vec![0u8, 1, 2, 3]));
+        assert!(
+            writers.contains_key(&7),
+            "Data leaves the writer table alone"
+        );
+        apply_event(&mut node, &mut writers, Ev::Down(7));
+        assert!(!writers.contains_key(&7), "Down removes the link's writer");
+    }
+
+    #[test]
+    fn apply_event_ingest_holds_a_valid_bundle_and_ignores_garbage() {
+        // Ev::Ingest is the durable-store rehydrate path: a well-formed sealed bundle addressed to a
+        // device we can't reach is parsed and held for store-and-forward, so the node's queue grows; a
+        // malformed ingest is a silent no-op (never a panic).
+        let mut node = test_node();
+        let mut writers = HashMap::new();
+        let recipient = Identity::generate();
+        let spk = recipient.derive_prekey();
+        let bytes = {
+            use hop_core::bundle::{Bundle, BundleOpts, Payload};
+            Bundle::create_private(
+                &recipient.address(),
+                &spk.public,
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b"hi".to_vec(),
+                },
+                None,
+                BundleOpts::default(),
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        assert!(node.queue().is_empty(), "a fresh node holds nothing");
+        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
+        assert!(
+            !node.queue().is_empty(),
+            "an ingested undeliverable bundle is held for forwarding"
+        );
+        let held = node.queue().len();
+        apply_event(&mut node, &mut writers, Ev::Ingest(vec![0xFF; 8]));
+        assert_eq!(
+            node.queue().len(),
+            held,
+            "an unparseable ingest is a no-op, not a panic"
+        );
+
+        // Also exercise the Device-addressed dst arm of the ingest log line (create_private above uses
+        // the Broadcast dst; a normal public message is Destination::Device).
+        let device_bundle = {
+            use hop_core::bundle::{Bundle, BundleOpts, Payload};
+            let sender = Identity::generate();
+            Bundle::create(
+                &sender,
+                Destination::Device(recipient.address()),
+                &recipient.address(),
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b"device-addressed".to_vec(),
+                },
+                BundleOpts::default(),
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        apply_event(&mut node, &mut writers, Ev::Ingest(device_bundle));
+
+        // And the Vaccine dst arm (a relay-vaccine bundle, §39): its ingest log line takes the
+        // "vaccine" branch of the destination match.
+        let vaccine_bundle = {
+            use hop_core::bundle::{Bundle, BundleOpts};
+            Bundle::create_vaccine([3u8; 32], BundleOpts::default())
+                .to_bytes()
+                .unwrap()
+        };
+        apply_event(&mut node, &mut writers, Ev::Ingest(vaccine_bundle));
+    }
+
+    #[test]
+    fn pump_outgoing_delivers_to_a_live_writer_and_drops_a_dead_one() {
+        // An Initiator link enqueues a Noise handshake packet on connect; pump_outgoing must route it
+        // to that link's writer channel. A writer whose receiver has been dropped (its thread is gone)
+        // must be evicted from the table when the send fails.
+        let mut node = test_node();
+        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+
+        let (live_tx, live_rx) = mpsc::channel::<Vec<u8>>();
+        node.handle(BearerEvent::Connected(1, Role::Initiator));
+        node.tick(now_ms());
+        writers.insert(1u64, live_tx);
+        pump_outgoing(&mut node, &mut writers);
+        assert!(
+            live_rx.try_recv().is_ok(),
+            "the handshake packet is delivered to link 1's live writer"
+        );
+        assert!(writers.contains_key(&1), "a live writer is retained");
+
+        let (dead_tx, dead_rx) = mpsc::channel::<Vec<u8>>();
+        drop(dead_rx); // the writer thread is gone: sends will fail
+        node.handle(BearerEvent::Connected(2, Role::Initiator));
+        node.tick(now_ms());
+        writers.insert(2u64, dead_tx);
+        pump_outgoing(&mut node, &mut writers);
+        assert!(
+            !writers.contains_key(&2),
+            "a writer whose thread is gone is dropped from the table"
+        );
+    }
+
+    #[test]
+    fn maybe_emit_stats_only_advances_on_the_10s_cadence() {
+        let node = test_node();
+        // Under the interval: no emit, the last-stats timestamp is unchanged.
+        assert_eq!(
+            maybe_emit_stats(&node, 1_000, 1_000 + 9_999),
+            1_000,
+            "under 10s: hold the timestamp (no emit)"
+        );
+        // At/after the interval: emit, the timestamp advances to `now`.
+        assert_eq!(
+            maybe_emit_stats(&node, 1_000, 1_000 + 10_000),
+            11_000,
+            "at 10s: emit and advance the timestamp"
+        );
+    }
+
+    #[test]
+    fn log_peer_changes_returns_the_current_peer_set_and_logs_departures() {
+        // A fresh node has no authenticated peers, so the returned "current" set is empty and equal in
+        // size to node.peers(). Passing a non-empty `prev` (a peer we thought was connected) exercises
+        // the "peer left" diff branch: prev has an address that cur does not, so it is logged as gone.
+        let node = test_node();
+        let empty = std::collections::HashSet::new();
+        let cur = log_peer_changes(&node, &empty);
+        assert_eq!(
+            cur.len(),
+            node.peers().len(),
+            "the returned set mirrors node.peers()"
+        );
+        let mut prev = std::collections::HashSet::new();
+        prev.insert(vec![7u8; 32]); // a stale "previously connected" peer, now absent
+        let cur2 = log_peer_changes(&node, &prev);
+        assert!(
+            cur2.is_empty(),
+            "the fresh node still has no peers; the stale peer is logged as departed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ws_and_tcp_driver_tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use tungstenite::Message;
+
+    #[test]
+    fn serve_ws_upgrade_bridges_binary_frames_both_ways_and_reports_down() {
+        // serve_ws(Upgrade) is the WS mesh driver: accept the upgrade, feed each inbound binary frame
+        // to the driver as Ev::Data, write each packet from the link's out channel back as a binary
+        // frame, and report Ev::Down on close. Drive it end to end with a real tungstenite client.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_nodelay(true).ok();
+            serve_ws(sock, WsKind::Upgrade, &ev_tx);
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).ok();
+        let (mut ws, _resp) =
+            tungstenite::client(format!("ws://127.0.0.1:{}/", addr.port()), stream).unwrap();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .ok();
+
+        // The link comes up; the driver gets a Sender to push outbound packets.
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).expect("link up") {
+            Ev::Up(_link, Role::Responder, out) => out,
+            _ => panic!("expected Ev::Up(Responder)"),
+        };
+
+        // Client → server: a binary frame arrives verbatim as Ev::Data.
+        ws.write(Message::Binary(b"ping-bytes".to_vec())).unwrap();
+        ws.flush().unwrap();
+        let data = loop {
+            match ev_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("data event")
+            {
+                Ev::Data(_l, b) => break b,
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            data, b"ping-bytes",
+            "inbound WS binary frame delivered verbatim"
+        );
+
+        // Server → client: bytes pushed into the link's out channel come back as a binary frame.
+        out.send(b"pong-bytes".to_vec()).unwrap();
+        let got = loop {
+            match ws.read() {
+                Ok(Message::Binary(b)) => break b,
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                {
+                    continue
+                }
+                Err(e) => panic!("client read failed: {e}"),
+            }
+        };
+        assert_eq!(
+            got, b"pong-bytes",
+            "outbound packet framed back to the client"
+        );
+
+        // Drop the client hard (no closing handshake): the server's next read errors out rather than
+        // seeing a clean Close frame, and the driver still observes Ev::Down for the link.
+        drop(ws);
+        let mut saw_down = false;
+        while let Ok(ev) = ev_rx.recv_timeout(Duration::from_secs(3)) {
+            if matches!(ev, Ev::Down(_)) {
+                saw_down = true;
+                break;
+            }
+        }
+        assert!(
+            saw_down,
+            "a hard client disconnect still reports the link down"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn serve_ws_tolerates_read_timeouts_and_breaks_when_the_out_channel_disconnects() {
+        // Two serve_ws edge paths: (1) an idle period trips the socket's read timeout
+        // (WouldBlock/TimedOut), which must be tolerated (the loop keeps going, link stays up); and
+        // (2) when the driver drops the link's out-channel sender, the write-drain loop observes
+        // Disconnected and breaks the connection, reporting the link down.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_nodelay(true).ok();
+            serve_ws(sock, WsKind::Upgrade, &ev_tx);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).ok();
+        let (mut ws, _r) =
+            tungstenite::client(format!("ws://127.0.0.1:{}/", addr.port()), stream).unwrap();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).expect("link up") {
+            Ev::Up(_l, Role::Responder, out) => out,
+            _ => panic!("expected Ev::Up(Responder)"),
+        };
+        // Idle past the server's 100ms read timeout so its read loop takes the WouldBlock/TimedOut
+        // branch at least once (a timed-out read must NOT tear the link down).
+        std::thread::sleep(Duration::from_millis(250));
+        // Drop the driver's out sender: serve_ws's write-drain loop sees Disconnected and breaks.
+        drop(out);
+        let mut saw_down = false;
+        while let Ok(ev) = ev_rx.recv_timeout(Duration::from_secs(3)) {
+            if matches!(ev, Ev::Down(_)) {
+                saw_down = true;
+                break;
+            }
+        }
+        assert!(
+            saw_down,
+            "dropping the link's out sender ends the WS session and reports it down"
+        );
+        let _ = ws.close(None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn serve_tcp_writer_thread_length_frames_outgoing_packets() {
+        // The writer half of serve_tcp: a packet pushed into the link's out channel is written back to
+        // the socket with a 4-byte big-endian length prefix (the exact framing the raw-TCP bearer
+        // relies on). Grab the out Sender from Ev::Up, push bytes, and read the framed bytes back.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_tcp(sock, Role::Responder, &ev_tx);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let out = match ev_rx.recv_timeout(Duration::from_secs(3)).expect("link up") {
+            Ev::Up(_l, Role::Responder, out) => out,
+            _ => panic!("expected Ev::Up(Responder)"),
+        };
+        out.send(b"payload!!".to_vec()).unwrap();
+
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(len) as usize,
+            9,
+            "the length prefix is the payload length"
+        );
+        let mut buf = vec![0u8; 9];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            &buf, b"payload!!",
+            "the payload is written verbatim after the prefix"
+        );
+
+        // Exercise the writer thread's write-error path: shut the socket, then push another packet so
+        // its framed write fails and it breaks (rather than only ending when the channel closes).
+        client.shutdown(std::net::Shutdown::Both).ok();
+        let _ = out.send(b"after-close".to_vec());
+        std::thread::sleep(Duration::from_millis(20));
+        drop(out); // end the writer thread's recv so serve_tcp returns
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod build_store_tests {
+    use super::*;
+
+    fn tmp_db(tag: &str) -> String {
+        format!(
+            "{}/hop-relayd-store-{tag}-{}-{}.db",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            NEXT_LINK.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn build_store_opens_a_usable_local_sqlite_store() {
+        // The plain (non-firestore) path: no project id => a local SQLite mailbox cache. The returned
+        // Box<dyn Store> must be a real, node-usable store and the db file must be created on disk.
+        let db = tmp_db("plain");
+        let _ = std::fs::remove_file(&db);
+        let addr = Identity::generate().address();
+        let store = build_store(&None, &db, &addr);
+        let _node = Node::with_store(Identity::generate(), store);
+        assert!(
+            std::fs::metadata(&db).is_ok(),
+            "the sqlite db file was created"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[cfg(not(feature = "firestore"))]
+    #[test]
+    fn build_store_falls_back_to_sqlite_when_firestore_is_not_compiled_in() {
+        // Without the firestore feature, even passing --firestore PROJECT must NOT fail: it warns and
+        // uses local SQLite, so a mis-flagged plain VM build still comes up with a working store.
+        let db = tmp_db("fallback");
+        let _ = std::fs::remove_file(&db);
+        let addr = Identity::generate().address();
+        let _store = build_store(&Some("some-gcp-project".to_string()), &db, &addr);
+        assert!(
+            std::fs::metadata(&db).is_ok(),
+            "fell back to a local sqlite db"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn sigterm_handler_flips_the_shutdown_flag() {
+        // F-21: install the (idempotent) handler, then invoke the async-signal-safe handler directly.
+        // It must set the SHUTDOWN atomic the driver loop polls each iteration to trigger the
+        // durable-store drain before exit.
+        let _lock = lock_driver_statics();
+        install_shutdown_handler();
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        on_sigterm(libc::SIGTERM);
+        assert!(
+            SHUTDOWN.load(Ordering::SeqCst),
+            "on_sigterm sets SHUTDOWN so the driver drains and exits"
+        );
+        SHUTDOWN.store(false, Ordering::SeqCst); // restore for any other test/run
+    }
+
+    #[test]
+    fn driver_step_applies_an_event_advances_the_heartbeat_and_exits_on_shutdown_or_close() {
+        // driver_step is one turn of the driver loop. With SHUTDOWN clear and an event queued, it must
+        // apply the event (via apply_event), advance the F-17 healthz heartbeat, and return true
+        // (continue). With SHUTDOWN set it drains the store and returns false (exit); a closed event
+        // channel also returns false. Serialize on the shared lock: it writes LAST_TICK_MS/SHUTDOWN.
+        let _lock = lock_driver_statics();
+        let mut node = Node::with_store(Identity::generate(), MemoryStore::new());
+        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut prev = std::collections::HashSet::new();
+        let mut last_stats = 0u64;
+        let (tx, rx) = mpsc::channel::<Ev>();
+
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        LAST_TICK_MS.store(0, Ordering::Relaxed);
+        let (out_tx, _out_rx) = mpsc::channel();
+        tx.send(Ev::Up(9, Role::Responder, out_tx)).unwrap();
+        assert!(
+            driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            "a queued event => continue"
+        );
+        assert!(
+            writers.contains_key(&9),
+            "the event was applied via apply_event"
+        );
+        assert_ne!(
+            LAST_TICK_MS.load(Ordering::Relaxed),
+            0,
+            "the F-17 heartbeat advanced this iteration"
+        );
+
+        // An idle iteration (channel open, nothing queued): recv_timeout elapses (~1s) and the node
+        // ticks, still returning true. This is the steady-state path of the loop.
+        assert!(
+            driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            "an idle iteration ticks the node and continues"
+        );
+
+        // SIGTERM: driver_step drains the durable store and signals exit.
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        assert!(
+            !driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            "SHUTDOWN set => drain and exit"
+        );
+        SHUTDOWN.store(false, Ordering::SeqCst);
+
+        // A closed event channel (all senders dropped) also ends the loop.
+        drop(tx);
+        assert!(
+            !driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            "a disconnected channel => exit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_stream_public_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn public_on_serves_the_ring_backlog_and_streams_live_lines() {
+        // services-03: with HOP_PUBLIC_LOG_STREAM=1 the log viewer gets the ring backlog (the
+        // else-branch) AND any live public line emitted while connected (the recv-line path). Drive
+        // serve_log_stream over a real socket against the global hub. Terminate robustly by closing the
+        // client then emitting one more line (its failed write breaks the loop), so the test does not
+        // depend on the deadline (which a parallel test could perturb via the env seam).
+        let _env = PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        std::env::set_var("HOP_PUBLIC_LOG_STREAM", "1");
+        // NB: deliberately do NOT set HOP_LOG_STREAM_MAX_MS. That env seam is owned by the
+        // CONN_TEST_LOCK log-stream tests (a different lock); writing it here would race them. This
+        // test instead terminates deterministically via the forced write-failure below, independent
+        // of whatever deadline is in effect.
+
+        // Seed a distinctive backlog line into the GLOBAL ring BEFORE the viewer connects.
+        netlog("PLS-BACKLOG stats: peers=1 held=0");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_log_stream(sock);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        // Emit a live line after the viewer has had a moment to subscribe (recv-line path).
+        std::thread::sleep(Duration::from_millis(120));
+        netlog("PLS-LIVE stats: peers=2 held=1");
+
+        // Read for up to ~3s or until both markers are seen.
+        let mut text = String::new();
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 2048];
+        while start.elapsed() < Duration::from_secs(3) {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if text.contains("PLS-BACKLOG") && text.contains("PLS-LIVE") {
+                        break;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // keep waiting (and let a live line be emitted/arrive)
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            text.contains("PLS-BACKLOG"),
+            "public-on exposes the ring backlog to the viewer: {text}"
+        );
+        assert!(
+            text.contains("PLS-LIVE"),
+            "a live public line is streamed to the viewer: {text}"
+        );
+
+        // Terminate the handler deterministically: close the client, then emit a line whose failed
+        // write breaks serve_log_stream's loop (independent of the deadline).
+        client.shutdown(std::net::Shutdown::Both).ok();
+        drop(client);
+        for _ in 0..5 {
+            netlog("PLS-DRAIN tick");
+            if server.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        server.join().unwrap();
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
     }
 }
