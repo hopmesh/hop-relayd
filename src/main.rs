@@ -334,6 +334,26 @@ fn serve_healthz(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
+/// services-r7-01: a NON-BLOCKING check for a `GET /healthz` request already buffered on a freshly
+/// accepted socket. Used by the WS accept loop to fast-path the Cloud Run liveness probe PAST the
+/// pending-peek budget, so a slowloris that fills `MAX_WS_PENDING` cannot starve the probe and force a
+/// false restart. Non-blocking is the whole point: if no bytes are buffered yet (a silent slowloris),
+/// `peek` returns `WouldBlock` and we return false instantly, so this never stalls the accept loop. It
+/// leaves the socket back in BLOCKING mode for whatever handler serves the connection next.
+fn peek_is_healthz(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 24];
+    let n = stream.peek(&mut buf).unwrap_or(0);
+    let _ = stream.set_nonblocking(false);
+    // The request line begins "GET /healthz ...". Only the buffered prefix is needed; a probe sends the
+    // whole line in one packet, so it is present by accept time on the same-host Cloud Run probe.
+    String::from_utf8_lossy(&buf[..n])
+        .to_ascii_lowercase()
+        .contains("get /healthz")
+}
+
 /// Stream the live network log to a plain-HTTP visitor (text/plain, incremental). Leads
 /// with this node's identity so a visitor to the anycast name sees which region answered.
 fn serve_log_stream(mut stream: TcpStream) {
@@ -535,7 +555,21 @@ fn main() {
         let listener = TcpListener::bind(&addr).expect("bind --ws address");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                // services-r3-02 / r5-01: the peek+classify MUST NOT run on this accept thread. It
+                // services-r7-01: a NON-BLOCKING healthz fast-path that a slowloris cannot starve. A
+                // Cloud Run liveness probe sends "GET /healthz" WITH the connection (same-host, one
+                // packet), so those bytes are already buffered by the time accept() returns. Peek them
+                // WITHOUT blocking (an empty buffer returns WouldBlock instantly, so a silent slowloris
+                // never stalls this loop) and, if it is a healthz probe, serve it EXEMPT from every
+                // budget on its own thread. This is what stops the r5 residual: a slowloris that fills
+                // MAX_WS_PENDING can no longer shed the liveness probe (which shared the WS port and was
+                // gated by that same pending budget before classification), so the container is not
+                // falsely restarted mid-attack. Non-healthz / not-yet-buffered connections fall through
+                // to the normal budgeted classify path unchanged.
+                if peek_is_healthz(&stream) {
+                    std::thread::spawn(move || serve_healthz(stream));
+                    continue;
+                }
+                // services-r3-02 / r5-01: the full peek+classify MUST NOT run on this accept thread. It
                 // has a multi-second read timeout, so one silent slowloris (connect, send nothing)
                 // would serially stall EVERY new accept here (mesh links, log viewers, healthz
                 // probes) behind its peek. So we admit against the PENDING-peek budget (NOT the mesh
@@ -1857,13 +1891,80 @@ mod control_path_tests {
     // exact surface that keeps a degraded/attacked relay from exhausting threads or memory, yet had
     // no direct tests. These exercise them so a regression fails a test, not CI.
     use super::{
-        admit_conn, admit_log_conn, frame_len_ok, MAX_CONNS, MAX_FRAME_BYTES, MAX_LOG_CONNS,
+        admit_conn, admit_log_conn, frame_len_ok, peek_is_healthz, MAX_CONNS, MAX_FRAME_BYTES,
+        MAX_LOG_CONNS,
     };
     use std::sync::Mutex;
 
     // These tests all mutate the process-global connection counters, so they must not run
     // concurrently with each other. Serialize them on one lock (Rust runs test fns in parallel).
     static CONN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn peek_is_healthz_fast_paths_a_probe_and_never_blocks_on_a_slowloris() {
+        // services-r7-01: the accept-loop healthz fast-path must (a) recognize a buffered `GET /healthz`
+        // so a liveness probe is served EXEMPT from the pending-peek budget (a slowloris that fills
+        // MAX_WS_PENDING can no longer starve it), and (b) return instantly for a silent slowloris
+        // (connect, send nothing) so it never stalls the accept loop. This is what closes the r5
+        // residual where healthz shared the WS port and was gated by the pending budget.
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        // (a) A healthz probe that sends its request line WITH the connection is recognized.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(60)); // hold open past the peek
+        });
+        let (sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(25)); // let the probe's bytes arrive
+        assert!(
+            peek_is_healthz(&sock),
+            "a buffered healthz probe is fast-pathed"
+        );
+        probe.join().unwrap();
+
+        // (b) A silent slowloris (no bytes) is NOT healthz, and the check returns instantly (non-blocking:
+        // if it blocked on the classify timeout this would hang / take seconds).
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let slow = std::thread::spawn(move || {
+            let _c = TcpStream::connect(addr2).unwrap();
+            std::thread::sleep(Duration::from_millis(60)); // connect, send nothing
+        });
+        let (sock2, _) = listener2.accept().unwrap();
+        let t0 = Instant::now();
+        assert!(
+            !peek_is_healthz(&sock2),
+            "a silent slowloris is not healthz"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "and the non-blocking peek does not stall the accept loop"
+        );
+        slow.join().unwrap();
+
+        // (c) A non-healthz request (a real mesh upgrade) is not fast-pathed - it takes the normal path.
+        let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr3 = listener3.local_addr().unwrap();
+        let other = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr3).unwrap();
+            c.write_all(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+        });
+        let (sock3, _) = listener3.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !peek_is_healthz(&sock3),
+            "a non-healthz request is not fast-pathed"
+        );
+        other.join().unwrap();
+    }
 
     #[test]
     fn frame_cap_rejects_oversized_and_accepts_at_the_bound() {
