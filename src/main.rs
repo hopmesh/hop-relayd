@@ -592,18 +592,44 @@ fn announce_startup(
 /// the event-handling logic (link up/down bookkeeping, data hand-off, ingest of a durable-store
 /// bundle) is unit-testable with a real `Node`; the loop itself only wraps this with the recv
 /// timeout tick and the shutdown drain.
+/// services-r7-01: run one core call under catch_unwind so a panic on attacker-controlled input (bundle
+/// decode / Noise / verify / DNSSEC-proof parse) becomes a logged skip instead of tearing down the
+/// always-on driver loop. relayd is the MOST internet-exposed process (it accepts connections from any
+/// mesh node worldwide with no prior trust), yet it was the ONE service missing this guard: the endpoint
+/// wraps every core call in guard_core (20 sites) and the gateway added it (services-r6-01), but relayd
+/// ran node.handle / ingest / provide_dns_proof / tick UNGUARDED on the main thread. A single core panic
+/// on unauthenticated bytes unwound the main thread and exited the process; Cloud Run restarted and the
+/// attacker resent the same packet: an unauthenticated remote crash-loop DoS. We do NOT log the bytes.
+fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!("hop-relayd: core panic in {what}; skipped (relay stays up)");
+            None
+        }
+    }
+}
+
 fn apply_event<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>, ev: Ev) {
     match ev {
         Ev::Up(link, role, out) => {
             writers.insert(link, out);
             netlog(format!("conn up: link={link} ({role:?})"));
-            node.handle(BearerEvent::Connected(link, role));
+            guard_core("bearer-connected", || {
+                node.handle(BearerEvent::Connected(link, role))
+            });
         }
-        Ev::Data(link, bytes) => node.handle(BearerEvent::Data(link, bytes)),
+        Ev::Data(link, bytes) => {
+            guard_core("bearer-data", || {
+                node.handle(BearerEvent::Data(link, bytes))
+            });
+        }
         Ev::Down(link) => {
             writers.remove(&link);
             netlog(format!("conn down: link={link}"));
-            node.handle(BearerEvent::Disconnected(link));
+            guard_core("bearer-disconnected", || {
+                node.handle(BearerEvent::Disconnected(link))
+            });
         }
         Ev::Ingest(bytes) => {
             if let Ok(b) = Bundle::from_bytes(&bytes) {
@@ -614,18 +640,23 @@ fn apply_event<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<V
                 };
                 // services-03: bundle id + destination address is per-message metadata.
                 netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
-                node.ingest(b);
+                guard_core("ingest", || node.ingest(b));
             }
         }
         #[cfg(feature = "firestore")]
-        Ev::DnsProof(domain, bodies) => node.provide_dns_proof(&domain, bodies),
+        Ev::DnsProof(domain, bodies) => {
+            guard_core("dns-proof", || node.provide_dns_proof(&domain, bodies));
+        }
     }
 }
 
 /// Drain the node's outgoing link packets to each link's writer thread, dropping a writer whose
 /// thread has gone. Extracted from the driver loop for unit testing.
 fn pump_outgoing<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>) {
-    for (link, bytes) in node.drain_outgoing() {
+    // Guarded like the other core calls: a panic while serializing outbound packets must not kill the
+    // driver either. On a caught panic there is simply nothing to pump this tick.
+    let outgoing = guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default();
+    for (link, bytes) in outgoing {
         if let Some(out) = writers.get(&link) {
             if out.send(bytes).is_err() {
                 writers.remove(&link); // connection's writer thread is gone
@@ -695,8 +726,10 @@ fn driver_step<S: Store>(
         return false;
     }
     match rx.recv_timeout(Duration::from_millis(1000)) {
-        Ok(ev) => apply_event(node, writers, ev),
-        Err(RecvTimeoutError::Timeout) => node.tick(now_ms()),
+        Ok(ev) => apply_event(node, writers, ev), // apply_event guards each core call internally
+        Err(RecvTimeoutError::Timeout) => {
+            guard_core("tick", || node.tick(now_ms()));
+        }
         Err(RecvTimeoutError::Disconnected) => return false,
     }
     pump_outgoing(node, writers);
@@ -3482,6 +3515,79 @@ mod driver_tests {
         );
         apply_event(&mut node, &mut writers, Ev::Down(7));
         assert!(!writers.contains_key(&7), "Down removes the link's writer");
+    }
+
+    // A Store that panics on put, to prove apply_event's guard_core wrapper (F-2) turns a core panic
+    // into a logged skip instead of a process kill. Everything else delegates to a real MemoryStore.
+    struct PanicOnPut(MemoryStore);
+    impl hop_core::store::Store for PanicOnPut {
+        fn put(&mut self, _b: hop_core::bundle::Bundle, _now_ms: u64) -> bool {
+            panic!("hostile bundle reached the store");
+        }
+        fn get(&self, id: &hop_core::bundle::BundleId) -> Option<hop_core::bundle::Bundle> {
+            self.0.get(id)
+        }
+        fn remove(&mut self, id: &hop_core::bundle::BundleId) -> Option<hop_core::bundle::Bundle> {
+            self.0.remove(id)
+        }
+        fn seen(&self, id: &hop_core::bundle::BundleId) -> bool {
+            self.0.seen(id)
+        }
+        fn contains(&self, id: &hop_core::bundle::BundleId) -> bool {
+            self.0.contains(id)
+        }
+        fn have(&self) -> hop_core::store::HaveSet {
+            self.0.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.0.prune(now_ms)
+        }
+        fn split_copies(&mut self, id: &hop_core::bundle::BundleId) -> u16 {
+            self.0.split_copies(id)
+        }
+        fn set_copies(&mut self, id: &hop_core::bundle::BundleId, copies: u16) {
+            self.0.set_copies(id, copies)
+        }
+    }
+
+    #[test]
+    fn guard_core_isolates_a_panic() {
+        // The isolation primitive: a panicking closure is caught and yields None; a normal one passes
+        // its value through. Revert-proof: remove the catch_unwind in guard_core and this test panics.
+        assert_eq!(guard_core("ok", || 42), Some(42));
+        assert!(guard_core("boom", || panic!("kaboom")).is_none());
+    }
+
+    #[test]
+    fn apply_event_survives_a_core_panic_on_hostile_bytes() {
+        // The whole point of F-2: a core panic while processing an ingested bundle must NOT kill the
+        // driver. Back the node with a store that panics on put; feed a valid bundle through Ev::Ingest;
+        // apply_event must return normally (guard_core swallowed the panic). Revert-proof: drop the
+        // guard_core wrapper around node.ingest and this test unwinds through apply_event and fails.
+        let mut node = Node::with_store(Identity::generate(), PanicOnPut(MemoryStore::new()));
+        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let recipient = Identity::generate();
+        let spk = recipient.derive_prekey();
+        let bytes = {
+            use hop_core::bundle::{Bundle, BundleOpts, Payload};
+            Bundle::create_private(
+                &recipient.address(),
+                &spk.public,
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: b"hi".to_vec(),
+                },
+                None,
+                BundleOpts::default(),
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        // If node.ingest -> store.put panics and is NOT caught, this call unwinds and the test fails.
+        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
+        // Reaching here means the panic was isolated; confirm the driver still processes the next event.
+        apply_event(&mut node, &mut writers, Ev::Data(1, vec![0u8, 1, 2, 3]));
     }
 
     #[test]
