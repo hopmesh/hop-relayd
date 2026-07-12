@@ -141,6 +141,81 @@ fn admit_ws_pending() -> Option<ConnGuard> {
     admit_against(&ACTIVE_WS_PENDING, MAX_WS_PENDING)
 }
 
+/// F-7: [`MAX_CONNS`]/[`MAX_WS_PENDING`] above are GLOBAL caps only: they bound how many connections
+/// exist, not how much of the single driver thread any one of them can consume. Every live link's
+/// `Ev::Data` funnels through the one-thread `apply_event` → `node.handle`, which runs a full Noise
+/// unwrap + bundle parse + crypto per frame. Unbounded, one hostile peer streaming max-size
+/// ([`MAX_FRAME_BYTES`]) frames back to back can monopolize that one thread, CPU-starving every other
+/// peer and stalling the F-17 `LAST_TICK_MS` heartbeat (risking a false `/healthz` 503 restart).
+///
+/// relayd sits behind a Cloud Run load balancer, so a per-CLIENT-IP limiter (like the endpoint's
+/// XFF-keyed `allow_source`/`MAX_REQ_PER_WINDOW`, F-19) is useless here: every connection shares the
+/// LB's one front-end IP, so an IP-keyed bucket would either throttle every peer as one global budget
+/// or (if it skips the LB IP, as the endpoint does) throttle nobody at all. The identity that actually
+/// distinguishes a hostile node from the rest is its Noise static key (its address), but that is only
+/// known once the XX handshake completes (`Node::peer_links`). See [`PeerRateKey`].
+const PEER_RATE_WINDOW_MS: u64 = 10_000; // same cadence as the endpoint's RATE_WINDOW
+/// Generous on purpose: real device traffic is small, bursty chat bundles, nowhere near this. Every
+/// frame is already bounded at [`MAX_FRAME_BYTES`] regardless of count, so this count budget also caps
+/// a single peer's worst-case cumulative decode work per window, which is the actual scarce resource
+/// (the one driver thread), while leaving ample headroom for organic high-throughput relaying.
+const MAX_PEER_MSGS_PER_WINDOW: u32 = 300;
+/// Above this many tracked keys we sweep expired windows so the map can't grow without bound as peers
+/// and links churn (mirrors the endpoint's `RATE_MAP_SWEEP_AT` and this file's dedup-map age-eviction).
+const PEER_RATE_SWEEP_AT: usize = 10_000;
+
+/// Who a driver-thread [`Ev::Data`] budget is charged against (F-7). Before the Noise XX handshake
+/// completes we don't yet know the peer's address, so an early flood (garbage that never completes a
+/// handshake) is still bounded, keyed by the LINK id instead: link ids are bearer-assigned and already
+/// implicitly bounded by [`MAX_CONNS`]/[`MAX_WS_PENDING`]. Once the handshake reveals an address
+/// (`Node::peer_links`), the budget follows the ADDRESS: that is what actually identifies a hostile
+/// party, since a peer that drops and redials gets a new link id but must still pay for a fresh Noise
+/// handshake before another `Data` frame of theirs is even eligible to be charged against it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum PeerRateKey {
+    Link(u64),
+    Peer(PubKeyBytes),
+}
+
+/// One fixed window's tally for a single [`PeerRateKey`].
+struct PeerRateWindow {
+    start_ms: u64,
+    msgs: u32,
+}
+
+/// Resolve the [`PeerRateKey`] for `link`: the authenticated peer address once the handshake has
+/// revealed one, else the link id itself. `O(live links)`, bounded by [`MAX_CONNS`].
+fn peer_rate_key<S: Store>(node: &Node<S>, link: u64) -> PeerRateKey {
+    node.peer_links()
+        .into_iter()
+        .find(|&(_, id)| id == link)
+        .map(|(addr, _)| PeerRateKey::Peer(addr))
+        .unwrap_or(PeerRateKey::Link(link))
+}
+
+/// True ⇔ `key` is still under [`MAX_PEER_MSGS_PER_WINDOW`] for the current fixed window (this call is
+/// counted against it either way). False ⇒ the caller must shed the frame, never hand it to
+/// `node.handle`, so a flood costs this O(1) map lookup, not a Noise-unwrap + parse + crypto pass.
+fn peer_data_allowed(
+    rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
+    key: PeerRateKey,
+    now: u64,
+) -> bool {
+    if rates.len() > PEER_RATE_SWEEP_AT {
+        rates.retain(|_, w| now.saturating_sub(w.start_ms) < PEER_RATE_WINDOW_MS);
+    }
+    let w = rates.entry(key).or_insert(PeerRateWindow {
+        start_ms: now,
+        msgs: 0,
+    });
+    if now.saturating_sub(w.start_ms) >= PEER_RATE_WINDOW_MS {
+        w.start_ms = now;
+        w.msgs = 0;
+    }
+    w.msgs += 1;
+    w.msgs <= MAX_PEER_MSGS_PER_WINDOW
+}
+
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
 /// stops advancing, so Cloud Run restarts a wedged instance instead of the default TCP check passing
 /// forever (with one instance per region, a wedged instance IS the region). `0` = not started yet.
@@ -610,7 +685,12 @@ fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-fn apply_event<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>, ev: Ev) {
+fn apply_event<S: Store>(
+    node: &mut Node<S>,
+    writers: &mut HashMap<u64, Sender<Vec<u8>>>,
+    peer_rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
+    ev: Ev,
+) {
     match ev {
         Ev::Up(link, role, out) => {
             writers.insert(link, out);
@@ -620,12 +700,24 @@ fn apply_event<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<V
             });
         }
         Ev::Data(link, bytes) => {
-            guard_core("bearer-data", || {
-                node.handle(BearerEvent::Data(link, bytes))
-            });
+            // F-7: charge this frame against the sender's per-identity budget BEFORE it costs a
+            // Noise-unwrap + parse + crypto pass. Over budget, shed silently: a per-peer flood is
+            // expected hostile behavior, not worth a log line per dropped frame (that would itself be
+            // a log-flood vector), and the connection/link stays up (only this frame is dropped).
+            let key = peer_rate_key(node, link);
+            if peer_data_allowed(peer_rates, key, now_ms()) {
+                guard_core("bearer-data", || {
+                    node.handle(BearerEvent::Data(link, bytes))
+                });
+            }
         }
         Ev::Down(link) => {
             writers.remove(&link);
+            // This link id is dead and (being a `u64` from an ever-incrementing counter) will never be
+            // reused, so its pre-auth [`PeerRateKey::Link`] entry, if any, can be dropped now rather
+            // than waiting for the age sweep. A `PeerRateKey::Peer` entry for whoever this link
+            // belonged to is deliberately left in place: it still bounds a same-window reconnect.
+            peer_rates.remove(&PeerRateKey::Link(link));
             netlog(format!("conn down: link={link}"));
             guard_core("bearer-disconnected", || {
                 node.handle(BearerEvent::Disconnected(link))
@@ -707,6 +799,7 @@ fn maybe_emit_stats<S: Store>(node: &Node<S>, last_stats_ms: u64, now: u64) -> u
 fn driver_step<S: Store>(
     node: &mut Node<S>,
     writers: &mut HashMap<u64, Sender<Vec<u8>>>,
+    peer_rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
     rx: &Receiver<Ev>,
     prev_peers: &mut std::collections::HashSet<Vec<u8>>,
     last_stats_ms: &mut u64,
@@ -726,7 +819,7 @@ fn driver_step<S: Store>(
         return false;
     }
     match rx.recv_timeout(Duration::from_millis(1000)) {
-        Ok(ev) => apply_event(node, writers, ev), // apply_event guards each core call internally
+        Ok(ev) => apply_event(node, writers, peer_rates, ev), // apply_event guards each core call internally
         Err(RecvTimeoutError::Timeout) => {
             guard_core("tick", || node.tick(now_ms()));
         }
@@ -913,6 +1006,8 @@ fn main() {
 
     // Driver: the sole owner of the node + the per-link outgoing senders.
     let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+    // F-7: per-peer-identity Ev::Data budgets, owned by the driver like `writers` above.
+    let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
     let mut prev_peers: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut last_stats_ms: u64 = 0;
     #[cfg(feature = "firestore")]
@@ -921,6 +1016,7 @@ fn main() {
         if !driver_step(
             &mut node,
             &mut writers,
+            &mut peer_rates,
             &rx,
             &mut prev_peers,
             &mut last_stats_ms,
@@ -3502,17 +3598,32 @@ mod driver_tests {
     fn apply_event_tracks_the_writer_table_across_up_data_down() {
         let mut node = test_node();
         let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
         let (out_tx, _out_rx) = mpsc::channel();
-        apply_event(&mut node, &mut writers, Ev::Up(7, Role::Responder, out_tx));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Up(7, Role::Responder, out_tx),
+        );
         assert!(writers.contains_key(&7), "Up registers the link's writer");
         // Garbage link bytes are tolerated (the node just fails to parse a frame); the table is intact.
-        apply_event(&mut node, &mut writers, Ev::Data(7, vec![0u8, 1, 2, 3]));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Data(7, vec![0u8, 1, 2, 3]),
+        );
         assert!(
             writers.contains_key(&7),
             "Data leaves the writer table alone"
         );
-        apply_event(&mut node, &mut writers, Ev::Down(7));
+        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Down(7));
         assert!(!writers.contains_key(&7), "Down removes the link's writer");
+        assert!(
+            !peer_rates.contains_key(&PeerRateKey::Link(7)),
+            "F-7: Down also releases the dead link's pre-auth rate-budget entry"
+        );
     }
 
     // A Store that panics on put, to prove apply_event's guard_core wrapper (F-2) turns a core panic
@@ -3564,6 +3675,7 @@ mod driver_tests {
         // guard_core wrapper around node.ingest and this test unwinds through apply_event and fails.
         let mut node = Node::with_store(Identity::generate(), PanicOnPut(MemoryStore::new()));
         let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
         let recipient = Identity::generate();
         let spk = recipient.derive_prekey();
         let bytes = {
@@ -3583,9 +3695,14 @@ mod driver_tests {
             .unwrap()
         };
         // If node.ingest -> store.put panics and is NOT caught, this call unwinds and the test fails.
-        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
+        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Ingest(bytes));
         // Reaching here means the panic was isolated; confirm the driver still processes the next event.
-        apply_event(&mut node, &mut writers, Ev::Data(1, vec![0u8, 1, 2, 3]));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Data(1, vec![0u8, 1, 2, 3]),
+        );
     }
 
     #[test]
@@ -3595,6 +3712,7 @@ mod driver_tests {
         // malformed ingest is a silent no-op (never a panic).
         let mut node = test_node();
         let mut writers = HashMap::new();
+        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
         let recipient = Identity::generate();
         let spk = recipient.derive_prekey();
         let bytes = {
@@ -3614,13 +3732,18 @@ mod driver_tests {
             .unwrap()
         };
         assert!(node.queue().is_empty(), "a fresh node holds nothing");
-        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
+        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Ingest(bytes));
         assert!(
             !node.queue().is_empty(),
             "an ingested undeliverable bundle is held for forwarding"
         );
         let held = node.queue().len();
-        apply_event(&mut node, &mut writers, Ev::Ingest(vec![0xFF; 8]));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Ingest(vec![0xFF; 8]),
+        );
         assert_eq!(
             node.queue().len(),
             held,
@@ -3646,7 +3769,12 @@ mod driver_tests {
             .to_bytes()
             .unwrap()
         };
-        apply_event(&mut node, &mut writers, Ev::Ingest(device_bundle));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Ingest(device_bundle),
+        );
 
         // And the Vaccine dst arm (a relay-vaccine bundle, §39): its ingest log line takes the
         // "vaccine" branch of the destination match.
@@ -3656,7 +3784,12 @@ mod driver_tests {
                 .to_bytes()
                 .unwrap()
         };
-        apply_event(&mut node, &mut writers, Ev::Ingest(vaccine_bundle));
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::Ingest(vaccine_bundle),
+        );
     }
 
     #[test]
@@ -3726,6 +3859,252 @@ mod driver_tests {
         assert!(
             cur2.is_empty(),
             "the fresh node still has no peers; the stale peer is logged as departed"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // F-7: per-authenticated-peer fairness cap on Ev::Data (gap-report pass-17 closure).
+    // ---------------------------------------------------------------------------------------
+
+    /// Hand-drive a full Noise XX handshake between `a` (as `a_role` over its own `a_link`) and `b`
+    /// (as `b_role` over its own `b_link`) until both settle, the same two-node pump pattern hop-core's
+    /// own node.rs tests use, ported here since that harness is private to hop-core's test module. 12
+    /// rounds is comfortably more than the 3-message XX exchange needs.
+    fn handshake(
+        a: &mut Node<MemoryStore>,
+        a_link: u64,
+        a_role: Role,
+        b: &mut Node<MemoryStore>,
+        b_link: u64,
+        b_role: Role,
+    ) {
+        a.handle(BearerEvent::Connected(a_link, a_role));
+        b.handle(BearerEvent::Connected(b_link, b_role));
+        for _ in 0..12 {
+            for (l, bytes) in a.drain_outgoing() {
+                if l == a_link {
+                    b.handle(BearerEvent::Data(b_link, bytes));
+                }
+            }
+            for (l, bytes) in b.drain_outgoing() {
+                if l == b_link {
+                    a.handle(BearerEvent::Data(a_link, bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn peer_data_allowed_admits_up_to_budget_then_sheds_and_resets_next_window() {
+        // The core F-7 primitive, tested directly against its own state: MAX_PEER_MSGS_PER_WINDOW
+        // calls for one key are admitted, the next is shed; a DIFFERENT key has its own untouched
+        // budget in the very same window (the fairness property); once the window rolls over, the
+        // original key is admitted again. Revert-proof: widen the `<=` to always pass (or drop it) in
+        // peer_data_allowed and the "shed" assertion below fails.
+        let mut rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let hostile = PeerRateKey::Peer([9u8; 32]);
+        let victim = PeerRateKey::Peer([4u8; 32]);
+        let start = 1_000_000u64;
+
+        for i in 0..MAX_PEER_MSGS_PER_WINDOW {
+            assert!(
+                peer_data_allowed(&mut rates, hostile, start + i as u64),
+                "message {i} is within budget"
+            );
+        }
+        assert!(
+            !peer_data_allowed(&mut rates, hostile, start + MAX_PEER_MSGS_PER_WINDOW as u64),
+            "the message past the window budget is shed"
+        );
+
+        // Fairness: a different peer's key has its own untouched budget in the same window.
+        assert!(
+            peer_data_allowed(&mut rates, victim, start + MAX_PEER_MSGS_PER_WINDOW as u64),
+            "a second peer is not shed by the first peer's exhausted budget"
+        );
+
+        // The window resets after PEER_RATE_WINDOW_MS: the hostile key is admitted again.
+        assert!(
+            peer_data_allowed(&mut rates, hostile, start + PEER_RATE_WINDOW_MS),
+            "a new fixed window resets the budget"
+        );
+    }
+
+    #[test]
+    fn peer_rate_key_follows_the_authenticated_address_not_the_link_id() {
+        // Before any handshake, an unknown link id has no peer yet: F-7 falls back to the link id
+        // itself, so even a pre-auth flood is bounded. Once the XX handshake completes, Node::peer_links
+        // reports the address, and the key switches to that address: the identity that survives a
+        // reconnect on a fresh link id, which is the whole point of not keying on IP behind the LB.
+        let mut a = test_node();
+        let mut b = test_node();
+        assert_eq!(
+            peer_rate_key(&a, 42),
+            PeerRateKey::Link(42),
+            "an unknown/unauthenticated link is keyed by link id"
+        );
+        handshake(&mut a, 1, Role::Initiator, &mut b, 2, Role::Responder);
+        assert_eq!(
+            peer_rate_key(&a, 1),
+            PeerRateKey::Peer(b.address()),
+            "once authenticated, the key follows the peer's address, not the link id"
+        );
+        assert_eq!(
+            peer_rate_key(&b, 2),
+            PeerRateKey::Peer(a.address()),
+            "symmetric on the other side of the same link"
+        );
+    }
+
+    #[test]
+    fn apply_event_caps_a_flooding_peer_by_identity_while_a_second_peer_is_unaffected() {
+        // F-7, the end-to-end proof. `d` is the relay under test, authenticated with two REAL peers
+        // (`hostile` and `victim`) over separate links. With `hostile` already at its budget for the
+        // window, apply_event must shed its next Data frame (the message never reaches node.handle, so
+        // it never lands in d's inbox), while `victim`'s frame, on a different link/identity, is
+        // delivered normally in the SAME window. That proves both the cap AND the fairness (per-node,
+        // not global/per-IP: relayd sits behind a Cloud Run LB, so both peers would look identical to an
+        // IP-keyed limiter). Revert-proof: drop the `if peer_data_allowed(...)` gate around the
+        // "bearer-data" guard_core call in apply_event (always call node.handle) and hostile's second
+        // message is delivered, failing the "is shed" assertion below.
+        let mut d = test_node();
+        let mut hostile = test_node();
+        let mut victim = test_node();
+        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+
+        const LINK_HOSTILE: u64 = 101;
+        const LINK_VICTIM: u64 = 102;
+        handshake(
+            &mut d,
+            LINK_HOSTILE,
+            Role::Responder,
+            &mut hostile,
+            1,
+            Role::Initiator,
+        );
+        handshake(
+            &mut d,
+            LINK_VICTIM,
+            Role::Responder,
+            &mut victim,
+            1,
+            Role::Initiator,
+        );
+        assert!(
+            d.peer_links().contains(&(hostile.address(), LINK_HOSTILE)),
+            "d and hostile completed the handshake"
+        );
+        assert!(
+            d.peer_links().contains(&(victim.address(), LINK_VICTIM)),
+            "d and victim completed the handshake"
+        );
+
+        // Publish + gossip d's prekey to both peers so send_to can open a forward-secret session to d
+        // (DESIGN.md §25: content is never static-sealed, so a real send needs this first).
+        d.publish_prekey().unwrap();
+        for _ in 0..4 {
+            for (l, bytes) in d.drain_outgoing() {
+                if l == LINK_HOSTILE {
+                    hostile.handle(BearerEvent::Data(1, bytes));
+                } else if l == LINK_VICTIM {
+                    victim.handle(BearerEvent::Data(1, bytes));
+                }
+            }
+        }
+
+        // Under budget: hostile's first message is handled normally and lands in d's inbox.
+        let sent = hostile
+            .send_to(
+                &d.address(),
+                "text/plain".into(),
+                b"hostile-1".to_vec(),
+                false,
+            )
+            .unwrap();
+        assert!(sent.is_some(), "hostile is connected + has d's prekey");
+        let outgoing = hostile.drain_outgoing();
+        assert!(
+            !outgoing.is_empty(),
+            "hostile's prekey-backed send produced real wire bytes (not deferred)"
+        );
+        for (l, bytes) in outgoing {
+            if l == 1 {
+                apply_event(
+                    &mut d,
+                    &mut writers,
+                    &mut peer_rates,
+                    Ev::Data(LINK_HOSTILE, bytes),
+                );
+            }
+        }
+        assert_eq!(
+            d.take_inbox().len(),
+            1,
+            "hostile's first, in-budget message is delivered"
+        );
+
+        // Simulate hostile having already spent its whole window's budget: equivalent to having
+        // already sent MAX_PEER_MSGS_PER_WINDOW frames this window, without looping that many times.
+        peer_rates.insert(
+            PeerRateKey::Peer(hostile.address()),
+            PeerRateWindow {
+                start_ms: now_ms(),
+                msgs: MAX_PEER_MSGS_PER_WINDOW,
+            },
+        );
+
+        // Over budget: hostile's next message must be shed BEFORE it reaches node.handle, so it never
+        // appears in d's inbox.
+        let sent2 = hostile
+            .send_to(
+                &d.address(),
+                "text/plain".into(),
+                b"hostile-2".to_vec(),
+                false,
+            )
+            .unwrap();
+        assert!(sent2.is_some());
+        for (l, bytes) in hostile.drain_outgoing() {
+            if l == 1 {
+                apply_event(
+                    &mut d,
+                    &mut writers,
+                    &mut peer_rates,
+                    Ev::Data(LINK_HOSTILE, bytes),
+                );
+            }
+        }
+        assert!(
+            d.take_inbox().is_empty(),
+            "hostile's over-budget message is shed, not delivered"
+        );
+
+        // Fairness: victim, a completely different authenticated peer, is unaffected by hostile's
+        // exhausted budget in the very same window and is delivered normally.
+        let sent3 = victim
+            .send_to(
+                &d.address(),
+                "text/plain".into(),
+                b"victim-1".to_vec(),
+                false,
+            )
+            .unwrap();
+        assert!(sent3.is_some());
+        for (l, bytes) in victim.drain_outgoing() {
+            if l == 1 {
+                apply_event(
+                    &mut d,
+                    &mut writers,
+                    &mut peer_rates,
+                    Ev::Data(LINK_VICTIM, bytes),
+                );
+            }
+        }
+        assert_eq!(
+            d.take_inbox().len(),
+            1,
+            "a second peer is not shed by the first peer's exhausted budget (per-node fairness)"
         );
     }
 }
@@ -3989,6 +4368,7 @@ mod shutdown_tests {
         let _lock = lock_driver_statics();
         let mut node = Node::with_store(Identity::generate(), MemoryStore::new());
         let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
         let mut prev = std::collections::HashSet::new();
         let mut last_stats = 0u64;
         let (tx, rx) = mpsc::channel::<Ev>();
@@ -3998,7 +4378,14 @@ mod shutdown_tests {
         let (out_tx, _out_rx) = mpsc::channel();
         tx.send(Ev::Up(9, Role::Responder, out_tx)).unwrap();
         assert!(
-            driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            driver_step(
+                &mut node,
+                &mut writers,
+                &mut peer_rates,
+                &rx,
+                &mut prev,
+                &mut last_stats
+            ),
             "a queued event => continue"
         );
         assert!(
@@ -4014,14 +4401,28 @@ mod shutdown_tests {
         // An idle iteration (channel open, nothing queued): recv_timeout elapses (~1s) and the node
         // ticks, still returning true. This is the steady-state path of the loop.
         assert!(
-            driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            driver_step(
+                &mut node,
+                &mut writers,
+                &mut peer_rates,
+                &rx,
+                &mut prev,
+                &mut last_stats
+            ),
             "an idle iteration ticks the node and continues"
         );
 
         // SIGTERM: driver_step drains the durable store and signals exit.
         SHUTDOWN.store(true, Ordering::SeqCst);
         assert!(
-            !driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            !driver_step(
+                &mut node,
+                &mut writers,
+                &mut peer_rates,
+                &rx,
+                &mut prev,
+                &mut last_stats
+            ),
             "SHUTDOWN set => drain and exit"
         );
         SHUTDOWN.store(false, Ordering::SeqCst);
@@ -4029,7 +4430,14 @@ mod shutdown_tests {
         // A closed event channel (all senders dropped) also ends the loop.
         drop(tx);
         assert!(
-            !driver_step(&mut node, &mut writers, &rx, &mut prev, &mut last_stats),
+            !driver_step(
+                &mut node,
+                &mut writers,
+                &mut peer_rates,
+                &rx,
+                &mut prev,
+                &mut last_stats
+            ),
             "a disconnected channel => exit"
         );
     }
