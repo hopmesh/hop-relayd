@@ -1126,11 +1126,9 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
     }
     // services-05: cap the WS message/frame size to match the raw-TCP bearer path, instead of
     // tungstenite's 64 MiB default, so neither transport accepts an oversized message.
-    let ws_config = tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(MAX_FRAME_BYTES),
-        max_frame_size: Some(MAX_FRAME_BYTES),
-        ..Default::default()
-    };
+    let ws_config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES));
     let mut ws = match tungstenite::accept_with_config(stream, Some(ws_config)) {
         Ok(w) => w,
         Err(_) => return, // malformed upgrade
@@ -1151,7 +1149,7 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
         loop {
             match out_rx.try_recv() {
                 Ok(bytes) => {
-                    if ws.write(Message::Binary(bytes)).is_err() {
+                    if ws.write(Message::Binary(bytes.into())).is_err() {
                         break 'conn;
                     }
                 }
@@ -1216,7 +1214,7 @@ fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
     'conn: loop {
         loop {
             match out_rx.try_recv() {
-                Ok(bytes) => match ws.write(Message::Binary(bytes)) {
+                Ok(bytes) => match ws.write(Message::Binary(bytes.into())) {
                     Ok(()) => {}
                     Err(tungstenite::Error::Io(e))
                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -3769,7 +3767,8 @@ mod ws_and_tcp_driver_tests {
         };
 
         // Client → server: a binary frame arrives verbatim as Ev::Data.
-        ws.write(Message::Binary(b"ping-bytes".to_vec())).unwrap();
+        ws.write(Message::Binary(b"ping-bytes".to_vec().into()))
+            .unwrap();
         ws.flush().unwrap();
         let data = loop {
             match ev_rx
@@ -3800,7 +3799,8 @@ mod ws_and_tcp_driver_tests {
             }
         };
         assert_eq!(
-            got, b"pong-bytes",
+            got,
+            b"pong-bytes".to_vec(),
             "outbound packet framed back to the client"
         );
 

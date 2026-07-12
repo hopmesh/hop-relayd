@@ -22,7 +22,7 @@ bs58 = "0.5"
 blake3.workspace = true
 # Sync WebSocket bearer. Default features = handshake only (no TLS): the global
 # load balancer terminates TLS, so the daemon speaks plain ws:// on $PORT.
-tungstenite = "0.24"
+tungstenite = "0.30"
 # HNS resolver (DESIGN.md §30): the cloud relay resolves `_hopaddress.<domain>` TXT over
 # DNS-over-HTTPS for peers that ask it. Only in the cloud (firestore) build.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }

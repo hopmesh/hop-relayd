@@ -18,7 +18,7 @@ use tungstenite::{Message, WebSocket};
 /// read one frame (within the socket's read timeout) and feed it to the node.
 fn pump<S: std::io::Read + std::io::Write>(node: &mut Node<MemoryStore>, ws: &mut WebSocket<S>) {
     for (_link, bytes) in node.drain_outgoing() {
-        let _ = ws.write(Message::Binary(bytes));
+        let _ = ws.write(Message::Binary(bytes.into()));
     }
     let _ = ws.flush();
     match ws.read() {
