@@ -157,23 +157,41 @@ fn admit_ws_pending() -> Option<ConnGuard> {
 const PEER_RATE_WINDOW_MS: u64 = 10_000; // same cadence as the endpoint's RATE_WINDOW
 /// Generous on purpose: real device traffic is small, bursty chat bundles, nowhere near this. Every
 /// frame is already bounded at [`MAX_FRAME_BYTES`] regardless of count, so this count budget also caps
-/// a single peer's worst-case cumulative decode work per window, which is the actual scarce resource
-/// (the one driver thread), while leaving ample headroom for organic high-throughput relaying.
+/// a single authenticated peer's worst-case cumulative decode work per window, which is the actual
+/// scarce resource (the one driver thread), while leaving ample headroom for organic high-throughput
+/// relaying.
 const MAX_PEER_MSGS_PER_WINDOW: u32 = 300;
+/// The budget for the single shared pre-handshake bucket (see [`PeerRateKey::PreAuth`]). Larger than a
+/// per-peer budget because EVERY connecting peer's handshake frames share it, so a burst of legitimate
+/// peers dialing at once (e.g. after a relay restart) must not be starved. A sustained pre-auth flood
+/// is still capped at this aggregate rate; the accepted cost is that under such a flood some legit
+/// handshakes are delayed (not dropped: the peer's bearer retries), never a memory or driver-thread DoS.
+const MAX_PREAUTH_MSGS_PER_WINDOW: u32 = 3_000;
 /// Above this many tracked keys we sweep expired windows so the map can't grow without bound as peers
-/// and links churn (mirrors the endpoint's `RATE_MAP_SWEEP_AT` and this file's dedup-map age-eviction).
+/// churn (mirrors the endpoint's `RATE_MAP_SWEEP_AT` and this file's dedup-map age-eviction).
 const PEER_RATE_SWEEP_AT: usize = 10_000;
+/// HARD ceiling on distinct tracked keys (pass-18 F-18a). The staleness sweep above is NOT a bound: an
+/// attacker minting fresh authenticated identities (one frame each, then disconnect) fills the map with
+/// NON-stale entries the sweep won't touch. Past this ceiling we force-evict the oldest-window entries
+/// regardless of staleness, so the map size is bounded no matter the churn rate. Only `Peer` entries can
+/// accumulate (all pre-auth traffic shares the one `PreAuth` bucket), and each still costs a full Noise
+/// XX handshake to create, but that is not itself a hard bound, so this ceiling is the backstop.
+const MAX_PEER_RATE_KEYS: usize = 20_000;
 
 /// Who a driver-thread [`Ev::Data`] budget is charged against (F-7). Before the Noise XX handshake
-/// completes we don't yet know the peer's address, so an early flood (garbage that never completes a
-/// handshake) is still bounded, keyed by the LINK id instead: link ids are bearer-assigned and already
-/// implicitly bounded by [`MAX_CONNS`]/[`MAX_WS_PENDING`]. Once the handshake reveals an address
-/// (`Node::peer_links`), the budget follows the ADDRESS: that is what actually identifies a hostile
-/// party, since a peer that drops and redials gets a new link id but must still pay for a fresh Noise
-/// handshake before another `Data` frame of theirs is even eligible to be charged against it.
+/// completes we don't yet know the peer's address, and behind the LB we have no usable per-source key
+/// for an unauthenticated connection, so ALL pre-handshake frames share ONE global [`PreAuth`] bucket.
+/// Keying pre-auth per LINK id (the pre-pass-18 design) was unsound: a link id is per-connection and
+/// ever-incrementing, so an attacker who never authenticates got a fresh budget on every reconnect
+/// (F-18b), and each dead link left a map entry (F-18a). One shared bucket caps aggregate pre-auth work
+/// regardless of connection churn. Once the handshake reveals an address (`Node::peer_links`), the
+/// budget follows that ADDRESS: the thing that actually identifies a hostile party, and it survives a
+/// drop-and-redial (a reconnecting peer must still complete a fresh handshake before a `Data` frame of
+/// theirs is charged to their address again).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum PeerRateKey {
-    Link(u64),
+    /// The single shared bucket for every not-yet-authenticated frame.
+    PreAuth,
     Peer(PubKeyBytes),
 }
 
@@ -184,18 +202,22 @@ struct PeerRateWindow {
 }
 
 /// Resolve the [`PeerRateKey`] for `link`: the authenticated peer address once the handshake has
-/// revealed one, else the link id itself. `O(live links)`, bounded by [`MAX_CONNS`].
+/// revealed one, else the shared [`PeerRateKey::PreAuth`] bucket. `O(live links)`, bounded by
+/// [`MAX_CONNS`]: relayd only learns a link's address by querying `Node::peer_links`, so this scan is
+/// inherent to relayd's position below the core's transport seam. It runs on the (already frame-bounded)
+/// driver thread and only for frames that pass the length cap.
 fn peer_rate_key<S: Store>(node: &Node<S>, link: u64) -> PeerRateKey {
     node.peer_links()
         .into_iter()
         .find(|&(_, id)| id == link)
         .map(|(addr, _)| PeerRateKey::Peer(addr))
-        .unwrap_or(PeerRateKey::Link(link))
+        .unwrap_or(PeerRateKey::PreAuth)
 }
 
-/// True ⇔ `key` is still under [`MAX_PEER_MSGS_PER_WINDOW`] for the current fixed window (this call is
-/// counted against it either way). False ⇒ the caller must shed the frame, never hand it to
-/// `node.handle`, so a flood costs this O(1) map lookup, not a Noise-unwrap + parse + crypto pass.
+/// True ⇔ `key` is still under its window budget (this call is counted against it either way). False ⇒
+/// the caller must shed the frame, never hand it to `node.handle`, so a flood costs this map lookup, not
+/// a Noise-unwrap + parse + crypto pass. `PreAuth` gets [`MAX_PREAUTH_MSGS_PER_WINDOW`]; an authenticated
+/// `Peer` gets the per-identity [`MAX_PEER_MSGS_PER_WINDOW`].
 fn peer_data_allowed(
     rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
     key: PeerRateKey,
@@ -204,6 +226,26 @@ fn peer_data_allowed(
     if rates.len() > PEER_RATE_SWEEP_AT {
         rates.retain(|_, w| now.saturating_sub(w.start_ms) < PEER_RATE_WINDOW_MS);
     }
+    // F-18a hard bound: if the staleness sweep did not get us under the ceiling, the map is full of
+    // CURRENT-window entries, i.e. an active fresh-identity flood. Force-evict down to half the ceiling,
+    // oldest windows first, so the map size is bounded regardless of churn. We remove an EXACT count of
+    // keys (not a start_ms cutoff), because under a same-window flood every entry shares one start_ms and
+    // a cutoff would evict nothing. Evicting an active entry only resets that key's window (a mild,
+    // self-correcting effect under attack), never a safety issue. This O(n log n) pass runs only while
+    // flooded past MAX_PEER_RATE_KEYS, never on the organic path.
+    if rates.len() >= MAX_PEER_RATE_KEYS {
+        let n_remove = rates.len() - MAX_PEER_RATE_KEYS / 2;
+        let mut by_age: Vec<(u64, PeerRateKey)> =
+            rates.iter().map(|(k, w)| (w.start_ms, *k)).collect();
+        by_age.sort_unstable_by_key(|(start, _)| *start);
+        for (_, k) in by_age.into_iter().take(n_remove) {
+            rates.remove(&k);
+        }
+    }
+    let budget = match key {
+        PeerRateKey::PreAuth => MAX_PREAUTH_MSGS_PER_WINDOW,
+        PeerRateKey::Peer(_) => MAX_PEER_MSGS_PER_WINDOW,
+    };
     let w = rates.entry(key).or_insert(PeerRateWindow {
         start_ms: now,
         msgs: 0,
@@ -213,7 +255,7 @@ fn peer_data_allowed(
         w.msgs = 0;
     }
     w.msgs += 1;
-    w.msgs <= MAX_PEER_MSGS_PER_WINDOW
+    w.msgs <= budget
 }
 
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
@@ -713,11 +755,10 @@ fn apply_event<S: Store>(
         }
         Ev::Down(link) => {
             writers.remove(&link);
-            // This link id is dead and (being a `u64` from an ever-incrementing counter) will never be
-            // reused, so its pre-auth [`PeerRateKey::Link`] entry, if any, can be dropped now rather
-            // than waiting for the age sweep. A `PeerRateKey::Peer` entry for whoever this link
-            // belonged to is deliberately left in place: it still bounds a same-window reconnect.
-            peer_rates.remove(&PeerRateKey::Link(link));
+            // No per-link rate entry to drop: pre-auth traffic shares the one `PreAuth` bucket (F-18b),
+            // and a `PeerRateKey::Peer` entry for whoever this link belonged to is deliberately left in
+            // place so a same-window reconnect cannot reset that identity's budget. The map is bounded by
+            // the staleness sweep + the MAX_PEER_RATE_KEYS hard ceiling in `peer_data_allowed`.
             netlog(format!("conn down: link={link}"));
             guard_core("bearer-disconnected", || {
                 node.handle(BearerEvent::Disconnected(link))
@@ -3618,11 +3659,17 @@ mod driver_tests {
             writers.contains_key(&7),
             "Data leaves the writer table alone"
         );
+        // The pre-auth Data frame above was charged to the single shared PreAuth bucket, not a per-link
+        // entry (F-18b): so there is exactly one rate key and it is PreAuth.
+        assert!(
+            peer_rates.contains_key(&PeerRateKey::PreAuth),
+            "F-7: an unauthenticated Data frame is charged to the shared PreAuth bucket"
+        );
         apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Down(7));
         assert!(!writers.contains_key(&7), "Down removes the link's writer");
         assert!(
-            !peer_rates.contains_key(&PeerRateKey::Link(7)),
-            "F-7: Down also releases the dead link's pre-auth rate-budget entry"
+            peer_rates.contains_key(&PeerRateKey::PreAuth),
+            "F-18b: Down does NOT reset the shared PreAuth budget (a reconnect can't dodge the cap)"
         );
     }
 
@@ -3931,17 +3978,70 @@ mod driver_tests {
     }
 
     #[test]
+    fn preauth_bucket_is_shared_and_generous_not_per_link() {
+        // F-18b: all pre-auth traffic shares ONE bucket with its own larger budget. Two different links
+        // (a reconnect, a fresh link id) draw down the SAME PreAuth budget, so churn cannot reset it.
+        // Revert-proof: key pre-auth per-link again and the "shared" assertion (exhausting via one key
+        // sheds the other) fails.
+        let mut rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let now = 5_000_000u64;
+        for i in 0..MAX_PREAUTH_MSGS_PER_WINDOW {
+            assert!(
+                peer_data_allowed(&mut rates, PeerRateKey::PreAuth, now + i as u64),
+                "pre-auth message {i} is within the shared budget"
+            );
+        }
+        // Budget spent: the next pre-auth frame is shed, whatever link it arrived on. A reconnecting
+        // attacker does not get a fresh budget (that was the F-18b hole).
+        assert!(
+            !peer_data_allowed(
+                &mut rates,
+                PeerRateKey::PreAuth,
+                now + MAX_PREAUTH_MSGS_PER_WINDOW as u64
+            ),
+            "F-18b: a reconnect cannot dodge the shared pre-auth cap"
+        );
+    }
+
+    // The shared pre-auth budget is strictly larger than a single peer's, so a burst of legit handshakes
+    // is not starved by the per-identity limit. A compile-time assertion (not a runtime one, which clippy
+    // rightly flags as const).
+    const _: () = assert!(MAX_PREAUTH_MSGS_PER_WINDOW > MAX_PEER_MSGS_PER_WINDOW);
+
+    #[test]
+    fn rate_map_is_hard_bounded_under_a_fresh_identity_flood() {
+        // F-18a: an attacker minting fresh authenticated identities (one frame each, same window, so the
+        // staleness sweep evicts nothing) must not grow peer_rates without bound. Insert well past the
+        // hard ceiling in a single window and assert the map stays bounded. Revert-proof: remove the
+        // MAX_PEER_RATE_KEYS force-eviction and this assertion fails (the map grows to the full count).
+        let mut rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let now = 7_000_000u64; // one fixed window for every insert
+        for i in 0..(MAX_PEER_RATE_KEYS as u64 + 5_000) {
+            let mut addr = [0u8; 32];
+            addr[..8].copy_from_slice(&i.to_le_bytes());
+            peer_data_allowed(&mut rates, PeerRateKey::Peer(addr), now);
+        }
+        assert!(
+            rates.len() <= MAX_PEER_RATE_KEYS,
+            "F-18a: the rate map is hard-bounded ({} <= {}) even under a same-window fresh-identity flood",
+            rates.len(),
+            MAX_PEER_RATE_KEYS
+        );
+    }
+
+    #[test]
     fn peer_rate_key_follows_the_authenticated_address_not_the_link_id() {
-        // Before any handshake, an unknown link id has no peer yet: F-7 falls back to the link id
-        // itself, so even a pre-auth flood is bounded. Once the XX handshake completes, Node::peer_links
-        // reports the address, and the key switches to that address: the identity that survives a
-        // reconnect on a fresh link id, which is the whole point of not keying on IP behind the LB.
+        // Before any handshake, an unknown link id has no peer yet: F-7 falls back to the shared PreAuth
+        // bucket (F-18b: NOT a per-link key, so reconnect churn can't multiply the pre-auth budget).
+        // Once the XX handshake completes, Node::peer_links reports the address, and the key switches to
+        // that address: the identity that survives a reconnect on a fresh link id, which is the whole
+        // point of not keying on IP behind the LB.
         let mut a = test_node();
         let mut b = test_node();
         assert_eq!(
             peer_rate_key(&a, 42),
-            PeerRateKey::Link(42),
-            "an unknown/unauthenticated link is keyed by link id"
+            PeerRateKey::PreAuth,
+            "an unknown/unauthenticated link shares the PreAuth bucket"
         );
         handshake(&mut a, 1, Role::Initiator, &mut b, 2, Role::Responder);
         assert_eq!(
