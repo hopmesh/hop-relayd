@@ -717,6 +717,21 @@ fn announce_startup(
 /// ran node.handle / ingest / provide_dns_proof / tick UNGUARDED on the main thread. A single core panic
 /// on unauthenticated bytes unwound the main thread and exited the process; Cloud Run restarted and the
 /// attacker resent the same packet: an unauthenticated remote crash-loop DoS. We do NOT log the bytes.
+///
+/// F-18d (pass-18 audit): this catches a panic around the WHOLE call (`node.handle`/`ingest`/
+/// `tick`/...), not around the individual `self.*` mutations inside one `on_bundle` match arm.
+/// That is coarse but deliberately so: `Node`'s fields are plain safe-Rust `HashMap`/`Vec` (no
+/// `unsafe` invariants), so a mid-arm panic is memory-safe regardless of where it lands. A
+/// dedicated audit of `on_bundle` (`core/hop-core/src/node.rs`) found no reachable panic between
+/// an arm's paired mutations (pending/tx/forwarded/store/subscriptions/...) from attacker-
+/// controlled input beyond one already-fixed case (dnssec.rs `hexd`); every attacker-shaped field
+/// is decoded via `Option`/`Result`, never an indexing/unwrap panic. Arms are also structured
+/// compute-then-commit or fail-safe-ordered (e.g. `Payload::HpsRekey` installs the new
+/// subscription before removing the old one, so a hypothetical future panic between them leaves a
+/// harmless stale duplicate, never a lost subscription) specifically so THIS coarse-grained catch
+/// stays sufficient. See `node::tests::hps_rekey_install_before_remove_survives_a_mid_arm_panic`
+/// and `node::tests::traced_ack_purge_arm_is_never_left_half_applied_under_a_mid_arm_panic` for
+/// the enforcing regression tests.
 fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
