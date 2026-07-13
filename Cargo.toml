@@ -23,14 +23,10 @@ blake3.workspace = true
 # Sync WebSocket bearer. Default features = handshake only (no TLS): the global
 # load balancer terminates TLS, so the daemon speaks plain ws:// on $PORT.
 tungstenite = "0.30"
-# HNS resolver (DESIGN.md §30): the cloud relay resolves `_hopaddress.<domain>` TXT over
-# DNS-over-HTTPS for peers that ask it. Only in the cloud (firestore) build.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
-serde_json = { version = "1", optional = true }
 
 [features]
-# Off by default so a plain VM build stays lean (no reqwest/rustls/tokio). Enable
-# for the scale-to-zero Cloud Run deploy that needs the durable Firestore mailbox
-# and the backbone (registry heartbeat + pull-on-wake dialing of wss:// peers, which
-# needs a TLS WebSocket client).
-firestore = ["dep:hop-store-firestore", "dep:reqwest", "dep:serde_json", "tungstenite/rustls-tls-webpki-roots"]
+# Off by default so a plain VM build stays lean (no rustls/tokio). Enable for the
+# scale-to-zero Cloud Run deploy that needs the durable Firestore mailbox and the
+# backbone (registry heartbeat + pull-on-wake dialing of wss:// peers, which needs a
+# TLS WebSocket client).
+firestore = ["dep:hop-store-firestore", "tungstenite/rustls-tls-webpki-roots"]

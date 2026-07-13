@@ -302,10 +302,6 @@ enum Ev {
     /// Only produced by the cloud handoff worker (the `firestore` feature).
     #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
     Ingest(Vec<u8>),
-    /// Raw DoH response bodies for a domain's full DNSSEC chain (DESIGN.md §30), from the DoH
-    /// worker; core validates + caches. `(domain, bodies)`. Only in the cloud build.
-    #[cfg(feature = "firestore")]
-    DnsProof(String, Vec<String>),
 }
 
 fn now_ms() -> u64 {
@@ -710,11 +706,11 @@ fn announce_startup(
 /// bundle) is unit-testable with a real `Node`; the loop itself only wraps this with the recv
 /// timeout tick and the shutdown drain.
 /// services-r7-01: run one core call under catch_unwind so a panic on attacker-controlled input (bundle
-/// decode / Noise / verify / DNSSEC-proof parse) becomes a logged skip instead of tearing down the
+/// decode / Noise / verify) becomes a logged skip instead of tearing down the
 /// always-on driver loop. relayd is the MOST internet-exposed process (it accepts connections from any
 /// mesh node worldwide with no prior trust), yet it was the ONE service missing this guard: the endpoint
 /// wraps every core call in guard_core (20 sites) and the gateway added it (services-r6-01), but relayd
-/// ran node.handle / ingest / provide_dns_proof / tick UNGUARDED on the main thread. A single core panic
+/// ran node.handle / ingest / tick UNGUARDED on the main thread. A single core panic
 /// on unauthenticated bytes unwound the main thread and exited the process; Cloud Run restarted and the
 /// attacker resent the same packet: an unauthenticated remote crash-loop DoS. We do NOT log the bytes.
 ///
@@ -724,7 +720,7 @@ fn announce_startup(
 /// `unsafe` invariants), so a mid-arm panic is memory-safe regardless of where it lands. A
 /// dedicated audit of `on_bundle` (`core/hop-core/src/node.rs`) found no reachable panic between
 /// an arm's paired mutations (pending/tx/forwarded/store/subscriptions/...) from attacker-
-/// controlled input beyond one already-fixed case (dnssec.rs `hexd`); every attacker-shaped field
+/// controlled input; every attacker-shaped field
 /// is decoded via `Option`/`Result`, never an indexing/unwrap panic. Arms are also structured
 /// compute-then-commit or fail-safe-ordered (e.g. `Payload::HpsRekey` installs the new
 /// subscription before removing the old one, so a hypothetical future panic between them leaves a
@@ -791,10 +787,6 @@ fn apply_event<S: Store>(
                 guard_core("ingest", || node.ingest(b));
             }
         }
-        #[cfg(feature = "firestore")]
-        Ev::DnsProof(domain, bodies) => {
-            guard_core("dns-proof", || node.provide_dns_proof(&domain, bodies));
-        }
     }
 }
 
@@ -850,7 +842,7 @@ fn maybe_emit_stats<S: Store>(node: &Node<S>, last_stats_ms: u64, now: u64) -> u
 /// store and signal exit (F-21), then process one event (or, on the recv timeout, tick), pump
 /// outgoing packets, and log peer/stat changes. Returns `false` when the loop should exit (SIGTERM
 /// drain done, or the event channel closed). Extracted from `main` so the per-iteration control flow
-/// is unit-testable; the firestore-only worker dispatch (DoH lookups + handoff snapshots) stays in
+/// is unit-testable; the firestore-only worker dispatch (handoff snapshots) stays in
 /// `main` and runs after each step.
 fn driver_step<S: Store>(
     node: &mut Node<S>,
@@ -1035,31 +1027,6 @@ fn main() {
         });
     }
 
-    // HNS resolver worker (DESIGN.md §30): drains domains the node wants resolved, fetches the
-    // whole DNSSEC chain over DNS-over-HTTPS (TXT + DNSKEY/DS up to the root) off this thread,
-    // and hands the raw response bodies back as Ev::DnsProof — core validates. Cloud-only.
-    #[cfg(feature = "firestore")]
-    let dns_tx: Sender<String> = {
-        let (dtx, drx) = mpsc::channel::<String>();
-        let ev_tx = tx.clone();
-        std::thread::spawn(move || {
-            let http = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("dns http client");
-            for domain in drx {
-                let bodies = fetch_dnssec_chain(&http, &domain);
-                // services-03: the resolved domain is sensitive (reveals who someone is looking up).
-                netlog_private(format!(
-                    "hns: fetched {} chain records for {domain}",
-                    bodies.len()
-                ));
-                let _ = ev_tx.send(Ev::DnsProof(domain, bodies));
-            }
-        });
-        dtx
-    };
-
     // Driver: the sole owner of the node + the per-link outgoing senders.
     let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
     // F-7: per-peer-identity Ev::Data budgets, owned by the driver like `writers` above.
@@ -1079,12 +1046,6 @@ fn main() {
         ) {
             break;
         }
-        // Dispatch any HNS lookups the node wants to the DoH worker (DESIGN.md §30).
-        #[cfg(feature = "firestore")]
-        for domain in node.take_dns_lookups() {
-            let _ = dns_tx.send(domain);
-        }
-
         // Feed the handoff worker a fresh snapshot of who's connected and what we can't
         // deliver locally, on a slow timer (the worker does the blocking Firestore I/O
         // off this thread, §28).
@@ -1503,41 +1464,6 @@ fn bs58_addr(addr: &[u8]) -> String {
 /// A short base58 prefix of an address for compact log lines.
 fn short_b58(addr: &[u8]) -> String {
     bs58::encode(addr).into_string().chars().take(10).collect()
-}
-
-/// Fetch a domain's full DNSSEC chain over DNS-over-HTTPS (DESIGN.md §30) as raw JSON response
-/// bodies for core to validate: the `_hopaddress.<domain>` TXT, plus DNSKEY + DS for every zone
-/// from the domain up to the root (all with `do=1` so the RRSIG/DNSKEY/DS records are returned).
-/// Core does the parsing + validation; the relay never decides the address.
-#[cfg(feature = "firestore")]
-fn fetch_dnssec_chain(http: &reqwest::blocking::Client, domain: &str) -> Vec<String> {
-    let doh = |name: &str, qtype: u16| -> Option<String> {
-        let url = format!("https://dns.google/resolve?name={name}&type={qtype}&do=1");
-        http.get(&url).send().ok()?.text().ok()
-    };
-    let mut bodies = Vec::new();
-    if let Some(b) = doh(&format!("_hopaddress.{domain}"), 16) {
-        bodies.push(b);
-    }
-    // Walk zones: domain, parent, …, then the root (".").
-    let mut zone = domain.to_string();
-    loop {
-        let is_root = zone == ".";
-        if let Some(b) = doh(&zone, 48) {
-            bodies.push(b); // DNSKEY
-        }
-        if is_root {
-            break;
-        }
-        if let Some(b) = doh(&zone, 43) {
-            bodies.push(b); // DS (lives in the parent, queried by the child name)
-        }
-        zone = match zone.find('.') {
-            Some(i) => zone[i + 1..].to_string(),
-            None => ".".to_string(),
-        };
-    }
-    bodies
 }
 
 /// The host of a `wss://`/`ws://` URL — the relay's identify name (DESIGN.md §29).
