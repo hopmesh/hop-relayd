@@ -275,6 +275,7 @@ static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// writes reports unhealthy instead of all-green. `None` for the sqlite/in-memory store (nothing is
 /// shed there). Set once at startup by `build_store`.
 static MIRROR_DROPPED: OnceLock<std::sync::Arc<AtomicU64>> = OnceLock::new();
+static MIRROR_FAILED: OnceLock<std::sync::Arc<AtomicU64>> = OnceLock::new();
 
 extern "C" fn on_sigterm(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -302,6 +303,10 @@ enum Ev {
     /// Only produced by the cloud handoff worker (the `firestore` feature).
     #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
     Ingest(Vec<u8>),
+    /// A mailbox pull whose source copy may be deleted only after the node has accepted and durably
+    /// flushed it. The driver acknowledges custody through the one-shot channel.
+    #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
+    IngestCustody(Vec<u8>, mpsc::SyncSender<bool>),
 }
 
 fn now_ms() -> u64 {
@@ -442,12 +447,20 @@ fn netlog_private(line: impl Into<String>) {
 /// stores-09: a nonzero `dropped` reports "degraded" in the body but stays 200 (we do NOT flip to 503
 /// on drops: a restart won't fix a Firestore outage and would drop the in-memory hot path too). Only
 /// a wedged driver (stale tick) is a restart-worthy 503.
-fn healthz_status(last_tick_ms: u64, now: u64, dropped: u64) -> (&'static str, String) {
+fn healthz_status(
+    last_tick_ms: u64,
+    now: u64,
+    dropped: u64,
+    failed: u64,
+) -> (&'static str, String) {
     let healthy = last_tick_ms != 0 && now.saturating_sub(last_tick_ms) < HEALTHZ_STALE_MS;
     if !healthy {
         ("503 Service Unavailable", "stale".to_string())
-    } else if dropped > 0 {
-        ("200 OK", format!("ok degraded: mirror_dropped={dropped}"))
+    } else if dropped > 0 || failed > 0 {
+        (
+            "200 OK",
+            format!("ok degraded: mirror_dropped={dropped} mirror_failed={failed}"),
+        )
     } else {
         ("200 OK", "ok".to_string())
     }
@@ -459,7 +472,11 @@ fn serve_healthz(mut stream: TcpStream) {
         .get()
         .map(|d| d.load(Ordering::Relaxed))
         .unwrap_or(0);
-    let (status, body) = healthz_status(last, now_ms(), dropped);
+    let failed = MIRROR_FAILED
+        .get()
+        .map(|d| d.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let (status, body) = healthz_status(last, now_ms(), dropped, failed);
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -776,18 +793,29 @@ fn apply_event<S: Store>(
             });
         }
         Ev::Ingest(bytes) => {
-            if let Ok(b) = Bundle::from_bytes(&bytes) {
-                let dst = match b.inner.dst {
-                    Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
-                    Destination::Broadcast => "broadcast".to_string(),
-                    Destination::Vaccine(..) => "vaccine".to_string(),
-                };
-                // services-03: bundle id + destination address is per-message metadata.
-                netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
-                guard_core("ingest", || node.ingest(b));
-            }
+            ingest_durable(node, bytes, false);
+        }
+        Ev::IngestCustody(bytes, ack) => {
+            let _ = ack.send(ingest_durable(node, bytes, true));
         }
     }
+}
+
+fn ingest_durable<S: Store>(node: &mut Node<S>, bytes: Vec<u8>, require_flush: bool) -> bool {
+    if let Ok(b) = Bundle::from_bytes(&bytes) {
+        let dst = match b.inner.dst {
+            Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
+            Destination::Broadcast => "broadcast".to_string(),
+            Destination::Vaccine(..) => "vaccine".to_string(),
+        };
+        // services-03: bundle id + destination address is per-message metadata.
+        netlog_private(format!("ingest: msg {} → dst {}", short_b58(&b.id()), dst));
+        if guard_core("ingest", || node.ingest(b)).is_none() {
+            return false;
+        }
+        return !require_flush || node.store.flush(Duration::from_secs(5));
+    }
+    false
 }
 
 /// Drain the node's outgoing link packets to each link's writer thread, dropping a writer whose
@@ -1374,6 +1402,7 @@ fn build_store(firestore: &Option<String>, db: &str, addr: &[u8]) -> Box<dyn Sto
                 // stores-09: expose the mirror's dropped-op counter to /healthz so a degraded
                 // Firestore (writes being shed under backpressure) surfaces as unhealthy.
                 let _ = MIRROR_DROPPED.set(s.mirror_dropped_handle());
+                let _ = MIRROR_FAILED.set(s.mirror_failed_handle());
                 return Box::new(s);
             }
             Err(e) => eprintln!("firestore open failed ({e}); falling back to sqlite"),
@@ -1632,6 +1661,15 @@ mod mailbox {
         fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
     }
 
+    /// One mailbox item offered to the driver. The durable source remains present until the driver
+    /// acknowledges that it accepted and flushed the bundle into its own store.
+    pub struct MailboxPull {
+        pub tag_b58: String,
+        pub id: BundleId,
+        pub bytes: Vec<u8>,
+        pub expires: u64,
+    }
+
     /// §39 P5 spool + want-beacon, store-agnostic. Spools each un-routable private bundle by its
     /// mailbox-tag; for each wanted tag, pulls anything held under it, dedups by id, deletes the
     /// spool copy, and returns the bytes to re-ingest. `spooled`/`pulled` carry cross-cycle dedup.
@@ -1641,7 +1679,7 @@ mod mailbox {
         wanted: &[Tag],
         spooled: &mut HashMap<(BundleId, Tag), u64>,
         pulled: &mut HashMap<BundleId, u64>,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<MailboxPull> {
         for (id, tag, bytes, expires) in spool {
             // services-r2-04: dedup value is the bundle's own expiry, so the caller can age-evict.
             if spooled.insert((*id, *tag), *expires).is_some() {
@@ -1681,16 +1719,20 @@ mod mailbox {
                     continue;
                 };
                 let id = b.id();
-                if pulled.insert(id, expires).is_none() {
+                if !pulled.contains_key(&id) {
                     // services-03: pull side of the spool/pull correlation; operator log only.
                     super::netlog_private(format!(
                         "want-beacon: pulled msg {} from mailbox {}",
                         super::short_b58(&id),
                         &tag_b58[..tag_b58.len().min(8)]
                     ));
-                    ingest.push(bytes);
+                    ingest.push(MailboxPull {
+                        tag_b58: tag_b58.clone(),
+                        id,
+                        bytes,
+                        expires,
+                    });
                 }
-                let _ = store.delete_mailbox_bundle(&tag_b58, &id);
             }
         }
         ingest
@@ -1809,21 +1851,26 @@ mod mailbox {
                 "want-beacon in region B pulls the bundle spooled in region A"
             );
             assert_eq!(
-                hop_core::bundle::Bundle::from_bytes(&out_b[0])
+                hop_core::bundle::Bundle::from_bytes(&out_b[0].bytes)
                     .unwrap()
                     .id(),
                 id,
                 "pulled the right bundle"
             );
 
-            // Exactly once: the spool copy is deleted, so a re-beacon (even a fresh worker) pulls nothing.
-            assert!(
+            // The source remains until the driver accepts and durably flushes custody.
+            assert_eq!(
                 store
                     .list_mailbox(&bs58::encode(tag).into_string())
                     .unwrap()
-                    .is_empty(),
-                "spool copy deleted after pull"
+                    .len(),
+                1,
+                "source retained before custody acknowledgement"
             );
+            store
+                .delete_mailbox_bundle(&out_b[0].tag_b58, &out_b[0].id)
+                .unwrap();
+            pl_b.insert(out_b[0].id, out_b[0].expires);
             let (mut sp_c, mut pl_c) = (HashMap::new(), HashMap::new());
             assert!(
                 process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
@@ -1839,9 +1886,17 @@ mod mailbox {
             let spk = bob.derive_prekey();
             let (id, tag, bytes) = private_bundle_for(&spk.public, &bob.address());
             let (mut sp, mut pl) = (HashMap::new(), HashMap::new());
-            process_mailbox(&store, &[(id, tag, bytes, 0)], &[], &mut sp, &mut pl);
+            process_mailbox(
+                &store,
+                &[(id, tag, bytes.clone(), 0)],
+                &[],
+                &mut sp,
+                &mut pl,
+            );
+            let first = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
+            pl.insert(first[0].id, first[0].expires);
             // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
-            let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, b"x", 0);
+            let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, &bytes, 0);
             let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
             assert!(
                 again.is_empty(),
@@ -1980,15 +2035,27 @@ mod handoff {
 
                     // §39 P5 spool + want-beacon, extracted into a store-agnostic function so the
                     // cross-region round trip is unit-testable with a fake shared mailbox (F-18).
-                    for bytes in process_mailbox(
+                    for pull in process_mailbox(
                         &presence,
                         &snap.spool,
                         &snap.wanted,
                         &mut spooled,
                         &mut pulled,
                     ) {
-                        if ev_tx.send(Ev::Ingest(bytes)).is_err() {
+                        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+                        if ev_tx.send(Ev::IngestCustody(pull.bytes, ack_tx)).is_err() {
                             return; // driver gone
+                        }
+                        if ack_rx.recv_timeout(Duration::from_secs(6)) == Ok(true) {
+                            if <Presence as MailboxStore>::delete_mailbox_bundle(
+                                &presence,
+                                &pull.tag_b58,
+                                &pull.id,
+                            )
+                            .is_ok()
+                            {
+                                pulled.insert(pull.id, pull.expires);
+                            }
                         }
                     }
                 }
@@ -3175,21 +3242,24 @@ mod healthz_tests {
         // tick with dropped mirror writes => 200 but "degraded"; a fresh tick with no drops => plain
         // 200 "ok"; and a tick older than the stale window => 503 stale (restart the wedged instance).
         assert_eq!(
-            healthz_status(0, 1_000_000, 0),
+            healthz_status(0, 1_000_000, 0, 0),
             ("503 Service Unavailable", "stale".to_string())
         );
-        let (s, b) = healthz_status(1_000_000, 1_000_500, 7);
+        let (s, b) = healthz_status(1_000_000, 1_000_500, 7, 0);
         assert_eq!(s, "200 OK");
         assert_eq!(
-            b, "ok degraded: mirror_dropped=7",
+            b, "ok degraded: mirror_dropped=7 mirror_failed=0",
             "a dropping mirror is reported, still 200"
         );
+        let (s, b) = healthz_status(1_000_000, 1_000_500, 0, 2);
+        assert_eq!(s, "200 OK");
+        assert_eq!(b, "ok degraded: mirror_dropped=0 mirror_failed=2");
         assert_eq!(
-            healthz_status(1_000_000, 1_000_500, 0),
+            healthz_status(1_000_000, 1_000_500, 0, 0),
             ("200 OK", "ok".to_string())
         );
         assert_eq!(
-            healthz_status(1_000_000, 1_000_000 + HEALTHZ_STALE_MS + 1, 0),
+            healthz_status(1_000_000, 1_000_000 + HEALTHZ_STALE_MS + 1, 0, 0),
             ("503 Service Unavailable", "stale".to_string()),
             "a tick older than the stale window is a restart-worthy 503"
         );
@@ -3778,6 +3848,47 @@ mod driver_tests {
             &mut peer_rates,
             Ev::Ingest(vaccine_bundle),
         );
+    }
+
+    #[test]
+    fn custody_ingest_acks_only_after_parse_accept_and_flush() {
+        let mut node = test_node();
+        let mut writers = HashMap::new();
+        let mut peer_rates = HashMap::new();
+
+        let (bad_tx, bad_rx) = mpsc::sync_channel(1);
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::IngestCustody(vec![0xFF; 8], bad_tx),
+        );
+        assert_eq!(bad_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+
+        let recipient = Identity::generate();
+        let sender = Identity::generate();
+        let bytes = Bundle::create(
+            &sender,
+            Destination::Device(recipient.address()),
+            &recipient.address(),
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"custody".to_vec(),
+            },
+            BundleOpts::default(),
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let (ok_tx, ok_rx) = mpsc::sync_channel(1);
+        apply_event(
+            &mut node,
+            &mut writers,
+            &mut peer_rates,
+            Ev::IngestCustody(bytes, ok_tx),
+        );
+        assert_eq!(ok_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+        assert!(!node.queue().is_empty());
     }
 
     #[test]
