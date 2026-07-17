@@ -436,6 +436,157 @@ fn netlog_private(line: impl Into<String>) {
     eprintln!("{} {}", hms(now_ms()), line.into());
 }
 
+// ---------------------------------------------------------------------------------------------
+// §35 keyed relay: access policy from flags + the usage ledger the meter flushes into.
+// The gate + meter live in hop-core (Node::on_bundle, the custody choke point); relayd's job is
+// configuration, the periodic drain into durable kv, and operator observability. Ledger rows are
+// per (hour, tenant): key `usage/{hour}/{tenant-hex}` under the node's kv (mirrored to Firestore
+// on the fleet), value = two u64 LE (bundles, payload bytes). The §37 reconciler reads these
+// rows from a watermark and turns them into Stripe meter events; only ever ADD fields by a new
+// key prefix, never re-shape this value in place.
+
+/// Parse exactly `N` bytes of lowercase/uppercase hex (2N chars). None on any malformation.
+fn parse_hex_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let s = s.trim();
+    if s.len() != N * 2 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Lowercase hex of arbitrary bytes (ledger keys, log lines).
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse a `--tenant-key` value `<tenant_hex16>:<pubkey_hex32>` into (TenantId, PubKeyBytes).
+/// None on any malformation (fails the keyed relay closed at startup).
+fn parse_tenant_key(s: &str) -> Option<(TenantId, PubKeyBytes)> {
+    let (t, k) = s.split_once(':')?;
+    Some((parse_hex_bytes::<16>(t)?, parse_hex_bytes::<32>(k)?))
+}
+
+/// Build the node's §35 admission policy from the parsed flags. `Ok(None)` = stay `Open` (the
+/// default everywhere). `--require-stamps` with zero usable roots is a configuration error and
+/// refuses startup: a keyed fleet must never silently run open because an operator fat-fingered
+/// a hex key.
+fn access_policy_from(
+    require_stamps: bool,
+    tenant_keys: &[(TenantId, PubKeyBytes)],
+    deny_tenants: &[TenantId],
+    stamp_flag_error: bool,
+) -> std::result::Result<Option<AccessPolicy>, String> {
+    if !require_stamps {
+        return Ok(None);
+    }
+    // Fail closed: a malformed --tenant-key/--deny-tenant would drop an entry (an authorized tenant
+    // silently refused, or the emergency denylist silently open). Never boot keyed on a typo.
+    if stamp_flag_error {
+        return Err("--require-stamps with a malformed --tenant-key/--deny-tenant".to_string());
+    }
+    if tenant_keys.is_empty() {
+        return Err("--require-stamps needs at least one valid --tenant-key".to_string());
+    }
+    let mut server = KeyServer::new();
+    for (tenant, pk) in tenant_keys {
+        server.insert(*tenant, *pk);
+    }
+    let denied = deny_tenants.iter().copied().collect();
+    Ok(Some(AccessPolicy::Keyed(KeyedAccess::new(server, denied))))
+}
+
+/// How often the driver drains the node's in-memory §35 usage into the durable ledger. A crash
+/// loses at most one interval; the ledger's granularity is the hour bucket regardless.
+const USAGE_FLUSH_MS: u64 = 30_000;
+
+/// Last ledger flush (driver-thread only; a static so `driver_step`'s signature stays put).
+static LAST_USAGE_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One ledger row key: per (hour bucket, tenant).
+fn usage_kv_key(hour: u64, tenant: &TenantId) -> String {
+    format!("usage/{hour}/{}", hex_string(tenant))
+}
+
+/// Ledger row value: `bundles` then `payload_bytes`, both u64 LE (16 bytes total).
+fn encode_usage(u: &Usage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&u.bundles.to_le_bytes());
+    out.extend_from_slice(&u.payload_bytes.to_le_bytes());
+    out
+}
+
+/// Decode a ledger row; anything malformed reads as zero (the row is then overwritten whole,
+/// so a corrupt value can never wedge the flush loop).
+fn decode_usage(bytes: &[u8]) -> Usage {
+    if bytes.len() != 16 {
+        return Usage::default();
+    }
+    Usage {
+        bundles: u64::from_le_bytes(bytes[..8].try_into().unwrap_or_default()),
+        payload_bytes: u64::from_le_bytes(bytes[8..].try_into().unwrap_or_default()),
+    }
+}
+
+/// Read-modify-write the drained per-tenant usage into the hour-bucketed ledger rows. Only this
+/// node writes its own kv, so the RMW is race-free. Returns the number of rows touched.
+fn merge_usage_into_store<S: Store>(
+    store: &mut S,
+    drained: &[(TenantId, Usage)],
+    now_ms: u64,
+) -> usize {
+    let hour = now_ms / 3_600_000;
+    for (tenant, usage) in drained {
+        let key = usage_kv_key(hour, tenant);
+        let mut total = store
+            .get_kv(&key)
+            .map(|b| decode_usage(&b))
+            .unwrap_or_default();
+        total.add(usage);
+        store.put_kv(&key, encode_usage(&total));
+    }
+    drained.len()
+}
+
+/// Drain the node's §35 meter + refusal counter into the ledger and the private log, now.
+fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
+    let refused = node.take_access_refused();
+    if refused > 0 {
+        // Aggregate count only, operator-only: a per-refusal line would be a traffic-analysis
+        // feed (services-03).
+        netlog_private(format!(
+            "access: refused {refused} foreign bundle(s) without a valid carriage stamp"
+        ));
+    }
+    let dropped = node.take_usage_dropped();
+    if dropped > 0 {
+        netlog_private(format!(
+            "usage: {dropped} accepted bundle(s) UNMETERED (tenant-map overflow) — shorten the flush interval"
+        ));
+    }
+    let drained = node.take_usage();
+    if drained.is_empty() {
+        return;
+    }
+    let rows = merge_usage_into_store(&mut node.store, &drained, now);
+    netlog_private(format!(
+        "usage: merged {rows} tenant row(s) into the ledger"
+    ));
+}
+
+/// Rate-limited flush, called once per driver iteration.
+fn maybe_flush_usage<S: Store>(node: &mut Node<S>, now: u64) {
+    let last = LAST_USAGE_FLUSH_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < USAGE_FLUSH_MS {
+        return;
+    }
+    LAST_USAGE_FLUSH_MS.store(now, Ordering::Relaxed);
+    flush_usage_now(node, now);
+}
+
 /// F-17: liveness probe. 200 only if the driver loop ticked within [`HEALTHZ_STALE_MS`]; else 503,
 /// so Cloud Run's startup/liveness probe restarts a wedged instance. This is a container-level probe
 /// (Cloud Run hits it internally); do NOT wire an external uptime check against region endpoints —
@@ -593,6 +744,20 @@ struct Config {
     advertise: Option<String>,
     /// 0 = handoff-only (no relay-to-relay dialing); >0 enables online-only epidemic fan-out.
     mesh_fanout: usize,
+    /// §35: require a valid carriage stamp before taking custody of any foreign bundle. Off by
+    /// default (an open relay); the hosted fleet turns it on with at least one --billing-root.
+    require_stamps: bool,
+    /// §35 keyserver: authorized (tenant id, stamping public key) pairs. A stamp whose signer is
+    /// not one of these never verifies ("an unauthed key cannot ride").
+    tenant_keys: Vec<(TenantId, PubKeyBytes)>,
+    /// §35 emergency denylist: tenant ids (hex, 16 bytes) refused before cert expiry.
+    deny_tenants: Vec<TenantId>,
+    /// Set when a `--billing-root`/`--deny-tenant` value failed to parse. A keyed relay MUST
+    /// refuse to start on this: silently skipping a malformed root shifts every later root's
+    /// kid index (a cert's `kid` is positional into the root list), so the fleet would boot
+    /// with the wrong key mapping and refuse all legitimate traffic; a skipped deny-tenant
+    /// would fail the emergency denylist open. Fatal only under `--require-stamps`.
+    stamp_flag_error: bool,
 }
 
 /// Parse the relay's command-line flags. A bare invocation (no `--listen`/`--ws`) defaults to the
@@ -609,6 +774,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Config {
         region: None,
         advertise: None,
         mesh_fanout: 0,
+        require_stamps: false,
+        tenant_keys: Vec::new(),
+        deny_tenants: Vec::new(),
+        stamp_flag_error: false,
     };
     let mut args = args;
     while let Some(a) = args.next() {
@@ -634,6 +803,25 @@ fn parse_args(args: impl Iterator<Item = String>) -> Config {
                     cfg.peers.push(p);
                 }
             }
+            // §35 keyed-relay flags. Malformed hex is skipped with a warning; the fatal case
+            // (--require-stamps with zero usable roots) is refused at startup by
+            // access_policy_from, never silently run open.
+            "--require-stamps" => cfg.require_stamps = true,
+            // --tenant-key <tenant_hex16>:<pubkey_hex32> adds one authorized tenant to the keyserver.
+            "--tenant-key" => match args.next().as_deref().and_then(parse_tenant_key) {
+                Some(pair) => cfg.tenant_keys.push(pair),
+                None => {
+                    eprintln!("bad --tenant-key: expected <32 hex>:<64 hex>");
+                    cfg.stamp_flag_error = true; // never silently drop an authorized tenant
+                }
+            },
+            "--deny-tenant" => match args.next().as_deref().and_then(parse_hex_bytes::<16>) {
+                Some(t) => cfg.deny_tenants.push(t),
+                None => {
+                    eprintln!("bad --deny-tenant: expected 32 hex chars");
+                    cfg.stamp_flag_error = true; // never fail the emergency denylist open
+                }
+            },
             other => eprintln!("ignoring unknown arg: {other}"),
         }
     }
@@ -675,6 +863,9 @@ fn configure_node<S: Store>(node: &mut Node<S>, advertise: Option<&str>) {
     node.set_max_relayed(8192);
     // Stamp the Hop-relay app id so a relay hop shows as "Hop Relay" in traces.
     node.set_app(hop_core::relay_app_id());
+    // §35 custody beacon: a relay advertises what it holds on connect so peers stop re-offering
+    // those, cutting the duplicate-ingress COGS that dominates a high-degree relay's cost.
+    node.set_emit_have(true);
     // Answer hop.identify as a relay, named by its public domain (the host of --advertise, e.g.
     // us-central1.relay.hopme.sh) so trace resolution shows relays by domain (§29).
     node.set_kind(NodeKind::Relay);
@@ -887,6 +1078,9 @@ fn driver_step<S: Store>(
     // spool/handoff write accepted just before Cloud Run reaps us survives. Cloud Run grants a grace
     // window on shutdown; bound the flush well inside it.
     if SHUTDOWN.load(Ordering::SeqCst) {
+        // Drain the §35 meter into the ledger BEFORE the store flush, so the counted usage
+        // rides the same mirror drain out (billing survives the reap; F-21).
+        flush_usage_now(node, now_ms());
         let flushed = node.store.flush(Duration::from_secs(8));
         netlog(format!(
             "SIGTERM: durable-store flush {} — exiting",
@@ -905,6 +1099,8 @@ fn driver_step<S: Store>(
     // Log authenticated peer joins/leaves privately; emit periodic public AGGREGATE stats.
     *prev_peers = log_peer_changes(node, prev_peers);
     *last_stats_ms = maybe_emit_stats(node, *last_stats_ms, now_ms());
+    // §35: periodically drain the meter into the durable usage ledger.
+    maybe_flush_usage(node, now_ms());
     true
 }
 
@@ -955,6 +1151,10 @@ fn main() {
         region,
         advertise,
         mesh_fanout,
+        require_stamps,
+        tenant_keys,
+        deny_tenants,
+        stamp_flag_error,
     } = parse_args(std::env::args().skip(1));
 
     let base_identity = load_identity(&identity_file, &format!("{db}.key"));
@@ -966,6 +1166,35 @@ fn main() {
     let store = build_store(&firestore, &db, &addr);
     let mut node = Node::with_store(identity, store);
     configure_node(&mut node, advertise.as_deref());
+    // Seed the node clock to wall time BEFORE serving. A relay's now_ms is 0 until the driver's
+    // first idle tick; without this seed, a stamped bundle arriving in that window is expiry-
+    // checked at now_ms=0, where every cert reads unexpired (0 >= exp is false), so an
+    // already-expired tenant cert would be admitted + metered. Seeding closes that startup gap.
+    node.set_time(now_ms());
+    // §35 keyed-relay admission, config-gated (default: open, exactly the pre-stamp behavior).
+    match access_policy_from(
+        require_stamps,
+        &tenant_keys,
+        &deny_tenants,
+        stamp_flag_error,
+    ) {
+        Err(e) => {
+            eprintln!("hop-relayd: {e}");
+            std::process::exit(2);
+        }
+        Ok(Some(policy)) => {
+            println!(
+                "hop-relayd: keyed relay: {} tenant key(s), {} denied tenant(s)",
+                tenant_keys.len(),
+                deny_tenants.len()
+            );
+            node.set_access_policy(policy);
+            // Populate the epoch hint tables against the clock we just seeded, so the first bundle
+            // (which may arrive before the first idle tick) is admitted, not refused.
+            node.refresh_access();
+        }
+        Ok(None) => {}
+    }
     announce_startup(
         listen.as_deref(),
         ws.as_deref(),
@@ -4681,5 +4910,197 @@ mod log_stream_public_tests {
         }
         server.join().unwrap();
         std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+    }
+}
+
+/// §35 keyed-relay configuration + usage-ledger tests. The gate/meter semantics themselves are
+/// proven in hop-core (access_gate_tests); this covers relayd's slice: flags -> policy, and the
+/// drain -> hour-bucketed kv ledger rows the §37 reconciler reads.
+#[cfg(test)]
+mod access_and_ledger_tests {
+    use super::*;
+    use hop_core::store::MemoryStore;
+
+    #[test]
+    fn hex_parsing_is_exact_and_rejects_malformation() {
+        assert_eq!(parse_hex_bytes::<2>("beef"), Some([0xbe, 0xef]));
+        assert_eq!(parse_hex_bytes::<2>("BEEF"), Some([0xbe, 0xef]));
+        assert_eq!(parse_hex_bytes::<2>(" beef "), Some([0xbe, 0xef]));
+        assert_eq!(parse_hex_bytes::<2>("bee"), None, "odd length");
+        assert_eq!(parse_hex_bytes::<2>("beefee"), None, "wrong length");
+        assert_eq!(parse_hex_bytes::<2>("bxef"), None, "non-hex");
+        assert_eq!(hex_string(&[0xbe, 0xef]), "beef");
+    }
+
+    #[test]
+    fn the_stamp_flags_parse_and_malformed_hex_flags_the_error() {
+        let key = Identity::generate();
+        let tenant_hex = "00112233445566778899aabbccddeeff";
+        let good = format!("{tenant_hex}:{}", hex_string(&key.address()));
+        let cfg = parse_args(
+            [
+                "--require-stamps",
+                "--tenant-key",
+                &good,
+                "--tenant-key",
+                "not-a-pair",
+                "--deny-tenant",
+                "ffeeddccbbaa99887766554433221100",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert!(cfg.require_stamps);
+        assert_eq!(
+            cfg.tenant_keys,
+            vec![(
+                [
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff
+                ],
+                key.address()
+            )]
+        );
+        assert!(
+            cfg.stamp_flag_error,
+            "a malformed --tenant-key sets the error flag"
+        );
+        assert_eq!(cfg.deny_tenants.len(), 1);
+    }
+
+    #[test]
+    fn tenant_key_parsing_is_exact() {
+        let pk = hex_string(&Identity::generate().address());
+        let t = "00112233445566778899aabbccddeeff";
+        assert!(parse_tenant_key(&format!("{t}:{pk}")).is_some());
+        assert!(
+            parse_tenant_key(&format!("{t}{pk}")).is_none(),
+            "no separator"
+        );
+        assert!(
+            parse_tenant_key(&format!("dead:{pk}")).is_none(),
+            "short tenant"
+        );
+        assert!(
+            parse_tenant_key(&format!("{t}:dead")).is_none(),
+            "short key"
+        );
+    }
+
+    #[test]
+    fn access_policy_from_covers_open_keyed_and_the_fatal_misconfig() {
+        let pair = ([9u8; 16], Identity::generate().address());
+        // Default: open.
+        assert!(matches!(
+            access_policy_from(false, &[], &[], false),
+            Ok(None)
+        ));
+        // Keyed with a tenant key: a Keyed policy.
+        assert!(matches!(
+            access_policy_from(true, &[pair], &[[9u8; 16]], false),
+            Ok(Some(AccessPolicy::Keyed(_)))
+        ));
+        // require-stamps with zero tenant keys: refused, never silently open.
+        assert!(access_policy_from(true, &[], &[], false).is_err());
+        // require-stamps with a malformed key flag: refused.
+        assert!(access_policy_from(true, &[pair], &[], true).is_err());
+    }
+
+    #[test]
+    fn the_policy_wires_through_to_the_node() {
+        let mut node = Node::new(Identity::generate());
+        let pair = ([1u8; 16], Identity::generate().address());
+        let policy = access_policy_from(true, &[pair], &[], false)
+            .unwrap()
+            .unwrap();
+        node.set_access_policy(policy);
+        assert!(matches!(node.access_policy(), AccessPolicy::Keyed(_)));
+    }
+
+    #[test]
+    fn ledger_rows_roundtrip_and_malformed_values_read_as_zero() {
+        let u = Usage {
+            bundles: 42,
+            payload_bytes: 1 << 40,
+        };
+        assert_eq!(decode_usage(&encode_usage(&u)), u);
+        assert_eq!(decode_usage(b"garbage"), Usage::default());
+        assert_eq!(decode_usage(&[]), Usage::default());
+    }
+
+    #[test]
+    fn merges_accumulate_within_an_hour_and_split_across_hours_and_tenants() {
+        let mut store = MemoryStore::new();
+        let t1: TenantId = [1u8; 16];
+        let t2: TenantId = [2u8; 16];
+        let hour0 = 10 * 3_600_000; // hour bucket 10
+                                    // Two flushes in the same hour accumulate into one row per tenant.
+        merge_usage_into_store(
+            &mut store,
+            &[
+                (
+                    t1,
+                    Usage {
+                        bundles: 3,
+                        payload_bytes: 300,
+                    },
+                ),
+                (
+                    t2,
+                    Usage {
+                        bundles: 1,
+                        payload_bytes: 10,
+                    },
+                ),
+            ],
+            hour0,
+        );
+        merge_usage_into_store(
+            &mut store,
+            &[(
+                t1,
+                Usage {
+                    bundles: 2,
+                    payload_bytes: 200,
+                },
+            )],
+            hour0 + 60_000,
+        );
+        assert_eq!(
+            decode_usage(&store.get_kv(&usage_kv_key(10, &t1)).unwrap()),
+            Usage {
+                bundles: 5,
+                payload_bytes: 500
+            }
+        );
+        assert_eq!(
+            decode_usage(&store.get_kv(&usage_kv_key(10, &t2)).unwrap()),
+            Usage {
+                bundles: 1,
+                payload_bytes: 10
+            }
+        );
+        // A flush in the next hour opens a new row; the old row is untouched.
+        merge_usage_into_store(
+            &mut store,
+            &[(
+                t1,
+                Usage {
+                    bundles: 7,
+                    payload_bytes: 700,
+                },
+            )],
+            11 * 3_600_000,
+        );
+        assert_eq!(
+            decode_usage(&store.get_kv(&usage_kv_key(11, &t1)).unwrap()).bundles,
+            7
+        );
+        assert_eq!(
+            decode_usage(&store.get_kv(&usage_kv_key(10, &t1)).unwrap()).bundles,
+            5
+        );
+        // And the ledger prefix lists exactly the three rows.
+        assert_eq!(store.list_kv("usage/").len(), 3);
     }
 }
