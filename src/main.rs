@@ -29,14 +29,19 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hop_core::admission::{
+    byte_channel, ByteReceiver, ByteReservation, ByteSender, QueueAdmissionError, QueueLimits,
+};
 use hop_core::prelude::*;
-use hop_core::store::Store;
+use hop_core::store::{DurabilityHandle, DurabilityReadiness, Store};
 #[cfg(feature = "firestore")]
 use hop_store_firestore::FirestoreStore;
+#[cfg(all(feature = "firestore", test))]
+use hop_store_firestore::FIRESTORE_STARTUP_MAX_BYTES;
 use hop_store_sqlite::SqliteStore;
 use tungstenite::Message;
 
@@ -46,6 +51,24 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 /// frame at this; the WS path must use the SAME bound instead of tungstenite's 64 MiB default, or a
 /// single WS client could push a 64 MiB message that the TCP path would have rejected at 1 MiB.
 const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
+const MAX_EVENT_QUEUE_EVENTS: usize = 512;
+const MAX_EVENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_SOURCE_EVENTS: usize = 32;
+const MAX_EVENT_SOURCE_BYTES: usize = MAX_EVENT_BYTES;
+const MAX_EVENT_BATCH: usize = 32;
+const DRIVER_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const DURABILITY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "firestore")]
+const FIRESTORE_READ_RESERVATION_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(feature = "firestore")]
+const FIRESTORE_READ_RESERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(feature = "firestore", test))]
+const MAX_RELAY_QUEUED_RESERVED_STARTUP_BYTES: usize =
+    MAX_EVENT_QUEUE_BYTES + FIRESTORE_STARTUP_MAX_BYTES;
+const MAX_OUTBOUND_FRAMES_PER_LINK: usize = 32;
+const FRAME_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_LOG_SUBSCRIBER_LINES: usize = 128;
 
 /// services-r2-02: the single frame-size predicate both the raw-TCP read loop and (via
 /// `WebSocketConfig`) the WS path enforce, extracted so the cap is unit-testable. A frame at or
@@ -161,12 +184,14 @@ const PEER_RATE_WINDOW_MS: u64 = 10_000; // same cadence as the endpoint's RATE_
 /// scarce resource (the one driver thread), while leaving ample headroom for organic high-throughput
 /// relaying.
 const MAX_PEER_MSGS_PER_WINDOW: u32 = 300;
+const MAX_PEER_BYTES_PER_WINDOW: usize = 32 * 1024 * 1024;
 /// The budget for the single shared pre-handshake bucket (see [`PeerRateKey::PreAuth`]). Larger than a
 /// per-peer budget because EVERY connecting peer's handshake frames share it, so a burst of legitimate
 /// peers dialing at once (e.g. after a relay restart) must not be starved. A sustained pre-auth flood
 /// is still capped at this aggregate rate; the accepted cost is that under such a flood some legit
 /// handshakes are delayed (not dropped: the peer's bearer retries), never a memory or driver-thread DoS.
 const MAX_PREAUTH_MSGS_PER_WINDOW: u32 = 3_000;
+const MAX_PREAUTH_BYTES_PER_WINDOW: usize = 64 * 1024 * 1024;
 /// Above this many tracked keys we sweep expired windows so the map can't grow without bound as peers
 /// churn (mirrors the endpoint's `RATE_MAP_SWEEP_AT` and this file's dedup-map age-eviction).
 const PEER_RATE_SWEEP_AT: usize = 10_000;
@@ -199,6 +224,7 @@ enum PeerRateKey {
 struct PeerRateWindow {
     start_ms: u64,
     msgs: u32,
+    bytes: usize,
 }
 
 /// Resolve the [`PeerRateKey`] for `link`: the authenticated peer address once the handshake has
@@ -206,14 +232,6 @@ struct PeerRateWindow {
 /// [`MAX_CONNS`]: relayd only learns a link's address by querying `Node::peer_links`, so this scan is
 /// inherent to relayd's position below the core's transport seam. It runs on the (already frame-bounded)
 /// driver thread and only for frames that pass the length cap.
-fn peer_rate_key<S: Store>(node: &Node<S>, link: u64) -> PeerRateKey {
-    node.peer_links()
-        .into_iter()
-        .find(|&(_, id)| id == link)
-        .map(|(addr, _)| PeerRateKey::Peer(addr))
-        .unwrap_or(PeerRateKey::PreAuth)
-}
-
 /// True ⇔ `key` is still under its window budget (this call is counted against it either way). False ⇒
 /// the caller must shed the frame, never hand it to `node.handle`, so a flood costs this map lookup, not
 /// a Noise-unwrap + parse + crypto pass. `PreAuth` gets [`MAX_PREAUTH_MSGS_PER_WINDOW`]; an authenticated
@@ -222,6 +240,7 @@ fn peer_data_allowed(
     rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
     key: PeerRateKey,
     now: u64,
+    bytes: usize,
 ) -> bool {
     if rates.len() > PEER_RATE_SWEEP_AT {
         rates.retain(|_, w| now.saturating_sub(w.start_ms) < PEER_RATE_WINDOW_MS);
@@ -242,20 +261,23 @@ fn peer_data_allowed(
             rates.remove(&k);
         }
     }
-    let budget = match key {
-        PeerRateKey::PreAuth => MAX_PREAUTH_MSGS_PER_WINDOW,
-        PeerRateKey::Peer(_) => MAX_PEER_MSGS_PER_WINDOW,
+    let (message_budget, byte_budget) = match key {
+        PeerRateKey::PreAuth => (MAX_PREAUTH_MSGS_PER_WINDOW, MAX_PREAUTH_BYTES_PER_WINDOW),
+        PeerRateKey::Peer(_) => (MAX_PEER_MSGS_PER_WINDOW, MAX_PEER_BYTES_PER_WINDOW),
     };
     let w = rates.entry(key).or_insert(PeerRateWindow {
         start_ms: now,
         msgs: 0,
+        bytes: 0,
     });
     if now.saturating_sub(w.start_ms) >= PEER_RATE_WINDOW_MS {
         w.start_ms = now;
         w.msgs = 0;
+        w.bytes = 0;
     }
     w.msgs += 1;
-    w.msgs <= budget
+    w.bytes = w.bytes.saturating_add(bytes);
+    w.msgs <= message_budget && w.bytes <= byte_budget
 }
 
 /// F-17: wall-clock ms of the driver loop's last iteration. `/healthz` reports unhealthy if this
@@ -276,6 +298,7 @@ static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// shed there). Set once at startup by `build_store`.
 static MIRROR_DROPPED: OnceLock<std::sync::Arc<AtomicU64>> = OnceLock::new();
 static MIRROR_FAILED: OnceLock<std::sync::Arc<AtomicU64>> = OnceLock::new();
+static DURABILITY: OnceLock<DurabilityHandle> = OnceLock::new();
 
 extern "C" fn on_sigterm(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -295,7 +318,7 @@ fn install_shutdown_handler() {
 /// connection hands the driver a `Sender` it pushes outgoing link packets into;
 /// the connection's own thread owns the transport and does the writing.
 enum Ev {
-    Up(u64, Role, Sender<Vec<u8>>),
+    Up(u64, Role, SyncSender<Vec<u8>>),
     Data(u64, Vec<u8>),
     Down(u64),
     /// A sealed bundle pulled from durable storage (a cross-partition handoff that
@@ -307,6 +330,239 @@ enum Ev {
     /// flushed it. The driver acknowledges custody through the one-shot channel.
     #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
     IngestCustody(Vec<u8>, mpsc::SyncSender<bool>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EventSource {
+    Link(u64),
+    Data(PeerRateKey),
+    Durable,
+}
+
+#[derive(Default)]
+struct IngressAdmission {
+    link_keys: HashMap<u64, PeerRateKey>,
+    rates: HashMap<PeerRateKey, PeerRateWindow>,
+}
+
+#[derive(Clone)]
+struct EventTx {
+    queue: ByteSender<Ev, EventSource>,
+    ingress: Arc<Mutex<IngressAdmission>>,
+    durability: DurabilityHandle,
+}
+
+struct DataReservation {
+    key: PeerRateKey,
+    capacity: ByteReservation<Ev, EventSource>,
+}
+
+impl EventTx {
+    fn send(&self, event: Ev) -> std::result::Result<(), QueueAdmissionError> {
+        if !self.durability.is_ready() && !matches!(&event, Ev::Down(_)) {
+            if let Ev::IngestCustody(_, ack) = &event {
+                let _ = ack.send(false);
+            }
+            return Err(QueueAdmissionError::NotReady);
+        }
+        match event {
+            Ev::Data(link, bytes) => self.try_send_data(link, bytes),
+            event => {
+                let (source, bytes, down) = match &event {
+                    Ev::Up(link, _, _) => (EventSource::Link(*link), 1, None),
+                    Ev::Down(link) => (EventSource::Link(*link), 1, Some(*link)),
+                    Ev::Ingest(bytes) => (EventSource::Durable, bytes.len(), None),
+                    Ev::IngestCustody(bytes, _) => (EventSource::Durable, bytes.len(), None),
+                    Ev::Data(..) => unreachable!(),
+                };
+                let result = self.queue.send(source, bytes, event);
+                if let Some(link) = down {
+                    self.ingress
+                        .lock()
+                        .expect("relay ingress lock")
+                        .link_keys
+                        .remove(&link);
+                }
+                result
+            }
+        }
+    }
+
+    fn data_permit(&self, link: u64, bytes: usize) -> Option<PeerRateKey> {
+        if !self.durability.is_ready() || bytes > MAX_FRAME_BYTES {
+            return None;
+        }
+        let mut admission = self.ingress.lock().expect("relay ingress lock");
+        let key = admission
+            .link_keys
+            .get(&link)
+            .copied()
+            .unwrap_or(PeerRateKey::PreAuth);
+        peer_data_allowed(&mut admission.rates, key, now_ms(), bytes).then_some(key)
+    }
+
+    fn try_send_permitted(
+        &self,
+        link: u64,
+        key: PeerRateKey,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        let len = bytes.len();
+        self.queue
+            .try_send(EventSource::Data(key), len, Ev::Data(link, bytes))
+    }
+
+    fn try_send_data(
+        &self,
+        link: u64,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        let key = self
+            .data_permit(link, bytes.len())
+            .ok_or(QueueAdmissionError::SourceFull)?;
+        self.try_send_permitted(link, key, bytes)
+    }
+
+    fn reserve_data(
+        &self,
+        link: u64,
+        bytes: usize,
+    ) -> std::result::Result<DataReservation, QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        if bytes > MAX_FRAME_BYTES {
+            return Err(QueueAdmissionError::EventTooLarge);
+        }
+        let key = self
+            .ingress
+            .lock()
+            .expect("relay ingress lock")
+            .link_keys
+            .get(&link)
+            .copied()
+            .unwrap_or(PeerRateKey::PreAuth);
+        let capacity =
+            self.queue
+                .reserve_timeout(EventSource::Data(key), bytes, FRAME_RESERVATION_TIMEOUT)?;
+        Ok(DataReservation { key, capacity })
+    }
+
+    fn send_reserved_data(
+        &self,
+        link: u64,
+        mut reservation: DataReservation,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        let len = bytes.len();
+        if len > MAX_FRAME_BYTES {
+            return Err(QueueAdmissionError::EventTooLarge);
+        }
+        let mut admission = self.ingress.lock().expect("relay ingress lock");
+        if !peer_data_allowed(&mut admission.rates, reservation.key, now_ms(), len) {
+            return Err(QueueAdmissionError::SourceFull);
+        }
+        drop(admission);
+        reservation.capacity.shrink_to(len);
+        reservation.capacity.try_send(Ev::Data(link, bytes))
+    }
+
+    fn bind_peers(&self, peers: &[(PubKeyBytes, u64)]) {
+        let mut admission = self.ingress.lock().expect("relay ingress lock");
+        let live: std::collections::HashSet<u64> = peers.iter().map(|(_, link)| *link).collect();
+        admission.link_keys.retain(|link, _| live.contains(link));
+        for (peer, link) in peers {
+            admission.link_keys.insert(*link, PeerRateKey::Peer(*peer));
+        }
+    }
+
+    fn protocol_ready(&self) -> bool {
+        self.durability.is_ready()
+    }
+
+    #[cfg(feature = "firestore")]
+    fn reserve_durable(
+        &self,
+    ) -> std::result::Result<ByteReservation<Ev, EventSource>, QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        self.queue.reserve_timeout(
+            EventSource::Durable,
+            FIRESTORE_READ_RESERVATION_BYTES,
+            FIRESTORE_READ_RESERVATION_TIMEOUT,
+        )
+    }
+
+    #[cfg(feature = "firestore")]
+    fn send_reserved_durable(
+        &self,
+        mut reservation: ByteReservation<Ev, EventSource>,
+        event: Ev,
+    ) -> std::result::Result<(), QueueAdmissionError> {
+        if !self.durability.is_ready() {
+            return Err(QueueAdmissionError::NotReady);
+        }
+        let bytes = match &event {
+            Ev::Ingest(bytes) | Ev::IngestCustody(bytes, _) => bytes.len(),
+            _ => return Err(QueueAdmissionError::SourceFull),
+        };
+        if bytes > reservation.bytes() {
+            reservation.grow_to(bytes, FIRESTORE_READ_RESERVATION_TIMEOUT)?;
+        } else {
+            reservation.shrink_to(bytes);
+        }
+        reservation.send(event)
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize) {
+        self.queue.usage()
+    }
+}
+
+struct EventRx(ByteReceiver<Ev, EventSource>);
+
+impl EventRx {
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Ev, RecvTimeoutError> {
+        self.0.recv_timeout(timeout)
+    }
+
+    fn try_recv(&self) -> std::result::Result<Ev, mpsc::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+#[cfg(test)]
+fn event_channel() -> (EventTx, EventRx) {
+    event_channel_with_durability(DurabilityHandle::ready())
+}
+
+fn event_channel_with_durability(durability: DurabilityHandle) -> (EventTx, EventRx) {
+    let (queue, rx) = byte_channel(QueueLimits {
+        max_events: MAX_EVENT_QUEUE_EVENTS,
+        max_bytes: MAX_EVENT_QUEUE_BYTES,
+        max_event_bytes: MAX_EVENT_BYTES,
+        max_source_events: MAX_EVENT_SOURCE_EVENTS,
+        max_source_bytes: MAX_EVENT_SOURCE_BYTES,
+    });
+    (
+        EventTx {
+            queue,
+            ingress: Arc::new(Mutex::new(IngressAdmission::default())),
+            durability,
+        },
+        EventRx(rx),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -376,7 +632,7 @@ struct LogHub {
 struct LogInner {
     who: String, // this relay's identity header (region + address)
     ring: VecDeque<String>,
-    subs: Vec<Sender<String>>,
+    subs: Vec<SyncSender<String>>,
 }
 
 impl LogHub {
@@ -394,13 +650,16 @@ impl LogHub {
         while g.ring.len() > 400 {
             g.ring.pop_front();
         }
-        g.subs.retain(|s| s.send(stamped.clone()).is_ok());
+        g.subs.retain(|s| match s.try_send(stamped.clone()) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     /// Register a viewer: returns this node's identity, the recent backlog (only when the public
     /// stream is enabled), and a stream of future public lines.
     fn subscribe(&self) -> (String, Vec<String>, Receiver<String>) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_LOG_SUBSCRIBER_LINES);
         let mut g = self.inner.lock().unwrap();
         g.subs.push(tx);
         let backlog = if public_log_stream_enabled() {
@@ -587,33 +846,37 @@ fn maybe_flush_usage<S: Store>(node: &mut Node<S>, now: u64) {
     flush_usage_now(node, now);
 }
 
-/// F-17: liveness probe. 200 only if the driver loop ticked within [`HEALTHZ_STALE_MS`]; else 503,
-/// so Cloud Run's startup/liveness probe restarts a wedged instance. This is a container-level probe
-/// (Cloud Run hits it internally); do NOT wire an external uptime check against region endpoints —
-/// DESIGN.md §1436 forbids externally probing regions because it wakes scaled-to-zero instances.
-/// The (status line, body) a health probe returns for a given last-tick, now, and durable-store
-/// dropped-op count. Extracted from [`serve_healthz`] so all three outcomes (stale 503, degraded
-/// 200, healthy 200) are unit-testable without driving the process-global tick/mirror statics.
-///
-/// stores-09: a nonzero `dropped` reports "degraded" in the body but stays 200 (we do NOT flip to 503
-/// on drops: a restart won't fix a Firestore outage and would drop the in-memory hot path too). Only
-/// a wedged driver (stale tick) is a restart-worthy 503.
+/// Readiness combines the driver heartbeat with durable custody. `/healthz` must not report success
+/// while Firestore has rejected or failed an accepted mutation. Cloud Run liveness uses `/livez`
+/// separately so a durable-backend outage stops traffic without inducing a restart loop.
 fn healthz_status(
     last_tick_ms: u64,
     now: u64,
+    readiness: DurabilityReadiness,
+    unreconciled: u64,
     dropped: u64,
     failed: u64,
 ) -> (&'static str, String) {
     let healthy = last_tick_ms != 0 && now.saturating_sub(last_tick_ms) < HEALTHZ_STALE_MS;
     if !healthy {
         ("503 Service Unavailable", "stale".to_string())
-    } else if dropped > 0 || failed > 0 {
+    } else if readiness != DurabilityReadiness::Ready {
         (
-            "200 OK",
-            format!("ok degraded: mirror_dropped={dropped} mirror_failed={failed}"),
+            "503 Service Unavailable",
+            format!(
+                "not ready: durability={readiness:?} unreconciled={unreconciled} mirror_rejected={dropped} mirror_failed={failed}"
+            ),
         )
     } else {
         ("200 OK", "ok".to_string())
+    }
+}
+
+fn livez_status(last_tick_ms: u64, now: u64) -> (&'static str, &'static str) {
+    if last_tick_ms != 0 && now.saturating_sub(last_tick_ms) < HEALTHZ_STALE_MS {
+        ("200 OK", "live")
+    } else {
+        ("503 Service Unavailable", "stale")
     }
 }
 
@@ -627,7 +890,25 @@ fn serve_healthz(mut stream: TcpStream) {
         .get()
         .map(|d| d.load(Ordering::Relaxed))
         .unwrap_or(0);
-    let (status, body) = healthz_status(last, now_ms(), dropped, failed);
+    let readiness = DURABILITY
+        .get()
+        .map(DurabilityHandle::status)
+        .unwrap_or(DurabilityReadiness::Ready);
+    let unreconciled = DURABILITY
+        .get()
+        .map(DurabilityHandle::unreconciled)
+        .unwrap_or(0);
+    let (status, body) = healthz_status(last, now_ms(), readiness, unreconciled, dropped, failed);
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+fn serve_livez(mut stream: TcpStream) {
+    let (status, body) = livez_status(LAST_TICK_MS.load(Ordering::Relaxed), now_ms());
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -642,7 +923,7 @@ fn serve_healthz(mut stream: TcpStream) {
 /// false restart. Non-blocking is the whole point: if no bytes are buffered yet (a silent slowloris),
 /// `peek` returns `WouldBlock` and we return false instantly, so this never stalls the accept loop. It
 /// leaves the socket back in BLOCKING mode for whatever handler serves the connection next.
-fn peek_is_healthz(stream: &TcpStream) -> bool {
+fn peek_is_probe(stream: &TcpStream, path: &str) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return false;
     }
@@ -653,17 +934,29 @@ fn peek_is_healthz(stream: &TcpStream) -> bool {
     // whole line in one packet, so it is present by accept time on the same-host Cloud Run probe.
     String::from_utf8_lossy(&buf[..n])
         .to_ascii_lowercase()
-        .contains("get /healthz")
+        .contains(&format!("get {path}"))
+}
+
+fn peek_is_healthz(stream: &TcpStream) -> bool {
+    peek_is_probe(stream, "/healthz") || peek_is_probe(stream, "/readyz")
+}
+
+fn peek_is_livez(stream: &TcpStream) -> bool {
+    peek_is_probe(stream, "/livez")
 }
 
 /// Stream the live network log to a plain-HTTP visitor (text/plain, incremental). Leads
 /// with this node's identity so a visitor to the anycast name sees which region answered.
-fn serve_log_stream(mut stream: TcpStream) {
+fn serve_log_stream(stream: TcpStream) {
+    serve_log_stream_for(stream, log_stream_max_ms());
+}
+
+fn serve_log_stream_for(mut stream: TcpStream, maximum_ms: u64) {
     // services-r3-01: a public log viewer holds one of the small [`MAX_LOG_CONNS`] slots. Bound how
     // long it can hold it with a total deadline, and use a write timeout so a stalled reader (a slow
     // or wedged TCP peer that never drains) cannot block this thread forever on `write_all`. Together
     // these guarantee the log pool keeps rotating and a silent/slow holder cannot pin a slot.
-    let deadline = std::time::Instant::now() + Duration::from_millis(log_stream_max_ms());
+    let deadline = std::time::Instant::now() + Duration::from_millis(maximum_ms);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let (who, backlog, rx) = log_hub().subscribe();
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
@@ -948,8 +1241,7 @@ fn guard_core<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
 
 fn apply_event<S: Store>(
     node: &mut Node<S>,
-    writers: &mut HashMap<u64, Sender<Vec<u8>>>,
-    peer_rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
+    writers: &mut HashMap<u64, SyncSender<Vec<u8>>>,
     ev: Ev,
 ) {
     match ev {
@@ -961,16 +1253,11 @@ fn apply_event<S: Store>(
             });
         }
         Ev::Data(link, bytes) => {
-            // F-7: charge this frame against the sender's per-identity budget BEFORE it costs a
-            // Noise-unwrap + parse + crypto pass. Over budget, shed silently: a per-peer flood is
-            // expected hostile behavior, not worth a log line per dropped frame (that would itself be
-            // a log-flood vector), and the connection/link stays up (only this frame is dropped).
-            let key = peer_rate_key(node, link);
-            if peer_data_allowed(peer_rates, key, now_ms()) {
-                guard_core("bearer-data", || {
-                    node.handle(BearerEvent::Data(link, bytes))
-                });
-            }
+            // Producer-side admission has already charged this frame to its authenticated identity
+            // (or the shared pre-auth bucket) before it entered the bounded queue.
+            guard_core("bearer-data", || {
+                node.handle(BearerEvent::Data(link, bytes))
+            });
         }
         Ev::Down(link) => {
             writers.remove(&link);
@@ -993,6 +1280,9 @@ fn apply_event<S: Store>(
 }
 
 fn ingest_durable<S: Store>(node: &mut Node<S>, bytes: Vec<u8>, require_flush: bool) -> bool {
+    if node.store.durability_status() != DurabilityReadiness::Ready {
+        return false;
+    }
     if let Ok(b) = Bundle::from_bytes(&bytes) {
         let dst = match b.inner.dst {
             Destination::Device(d) | Destination::AckTo(d, _) => short_b58(&d),
@@ -1004,23 +1294,34 @@ fn ingest_durable<S: Store>(node: &mut Node<S>, bytes: Vec<u8>, require_flush: b
         if guard_core("ingest", || node.ingest(b)).is_none() {
             return false;
         }
-        return !require_flush || node.store.flush(Duration::from_secs(5));
+        return node.store.durability_status() == DurabilityReadiness::Ready
+            && (!require_flush || node.store.flush(Duration::from_secs(5)));
     }
     false
 }
 
 /// Drain the node's outgoing link packets to each link's writer thread, dropping a writer whose
 /// thread has gone. Extracted from the driver loop for unit testing.
-fn pump_outgoing<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, Sender<Vec<u8>>>) {
+fn pump_outgoing<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, SyncSender<Vec<u8>>>) {
     // Guarded like the other core calls: a panic while serializing outbound packets must not kill the
     // driver either. On a caught panic there is simply nothing to pump this tick.
     let outgoing = guard_core("drain-outgoing", || node.drain_outgoing()).unwrap_or_default();
+    let mut blocked = Vec::new();
     for (link, bytes) in outgoing {
         if let Some(out) = writers.get(&link) {
-            if out.send(bytes).is_err() {
-                writers.remove(&link); // connection's writer thread is gone
+            if matches!(
+                out.try_send(bytes),
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_))
+            ) {
+                blocked.push(link);
             }
         }
+    }
+    for link in blocked {
+        writers.remove(&link);
+        guard_core("bearer-disconnected", || {
+            node.handle(BearerEvent::Disconnected(link))
+        });
     }
 }
 
@@ -1063,13 +1364,19 @@ fn maybe_emit_stats<S: Store>(node: &Node<S>, last_stats_ms: u64, now: u64) -> u
 /// drain done, or the event channel closed). Extracted from `main` so the per-iteration control flow
 /// is unit-testable; the firestore-only worker dispatch (handoff snapshots) stays in
 /// `main` and runs after each step.
+struct DriverSchedule {
+    last_stats_ms: u64,
+    next_tick: Instant,
+    next_durability_probe: Instant,
+}
+
 fn driver_step<S: Store>(
     node: &mut Node<S>,
-    writers: &mut HashMap<u64, Sender<Vec<u8>>>,
-    peer_rates: &mut HashMap<PeerRateKey, PeerRateWindow>,
-    rx: &Receiver<Ev>,
+    writers: &mut HashMap<u64, SyncSender<Vec<u8>>>,
+    tx: &EventTx,
+    rx: &EventRx,
     prev_peers: &mut std::collections::HashSet<Vec<u8>>,
-    last_stats_ms: &mut u64,
+    schedule: &mut DriverSchedule,
 ) -> bool {
     // F-17: heartbeat for /healthz. The loop iterates at least once per second (recv timeout → tick);
     // if node.handle/tick ever deadlocks, this stops advancing and /healthz goes 503.
@@ -1088,26 +1395,106 @@ fn driver_step<S: Store>(
         ));
         return false;
     }
-    match rx.recv_timeout(Duration::from_millis(1000)) {
-        Ok(ev) => apply_event(node, writers, peer_rates, ev), // apply_event guards each core call internally
+    if node.store.durability_status() != DurabilityReadiness::Ready {
+        if Instant::now() >= schedule.next_durability_probe {
+            let _ = node.store.probe_durability();
+            schedule.next_durability_probe = Instant::now() + DURABILITY_PROBE_INTERVAL;
+        }
+        if node.store.durability_status() != DurabilityReadiness::Ready {
+            suspend_protocol(node, writers);
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => reject_degraded_event(event),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+            while schedule.next_tick <= Instant::now() {
+                schedule.next_tick += DRIVER_TICK_INTERVAL;
+            }
+            return true;
+        }
+    }
+    tick_if_due(node, &mut schedule.next_tick);
+    let wait = schedule.next_tick.saturating_duration_since(Instant::now());
+    let first = match rx.recv_timeout(wait) {
+        Ok(event) => Some(event),
         Err(RecvTimeoutError::Timeout) => {
-            guard_core("tick", || node.tick(now_ms()));
+            tick_if_due(node, &mut schedule.next_tick);
+            None
         }
         Err(RecvTimeoutError::Disconnected) => return false,
+    };
+    if let Some(first) = first {
+        apply_event(node, writers, first);
+        tx.bind_peers(&node.peer_links());
+        for _ in 1..MAX_EVENT_BATCH {
+            if node.store.durability_status() != DurabilityReadiness::Ready {
+                break;
+            }
+            if Instant::now() >= schedule.next_tick {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(event) => {
+                    apply_event(node, writers, event);
+                    tx.bind_peers(&node.peer_links());
+                    if node.store.durability_status() != DurabilityReadiness::Ready {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
     }
+    if node.store.durability_status() != DurabilityReadiness::Ready {
+        suspend_protocol(node, writers);
+        return true;
+    }
+    tick_if_due(node, &mut schedule.next_tick);
     pump_outgoing(node, writers);
     // Log authenticated peer joins/leaves privately; emit periodic public AGGREGATE stats.
     *prev_peers = log_peer_changes(node, prev_peers);
-    *last_stats_ms = maybe_emit_stats(node, *last_stats_ms, now_ms());
+    schedule.last_stats_ms = maybe_emit_stats(node, schedule.last_stats_ms, now_ms());
     // §35: periodically drain the meter into the durable usage ledger.
     maybe_flush_usage(node, now_ms());
     true
 }
 
+fn reject_degraded_event(event: Ev) {
+    if let Ev::IngestCustody(_, ack) = event {
+        let _ = ack.send(false);
+    }
+}
+
+fn suspend_protocol<S: Store>(node: &mut Node<S>, writers: &mut HashMap<u64, SyncSender<Vec<u8>>>) {
+    let links: Vec<u64> = writers.keys().copied().collect();
+    writers.clear();
+    for link in links {
+        guard_core("durability-disconnect", || {
+            node.handle(BearerEvent::Disconnected(link))
+        });
+    }
+}
+
+fn tick_if_due<S: Store>(node: &mut Node<S>, next_tick: &mut Instant) {
+    let monotonic_now = Instant::now();
+    if monotonic_now < *next_tick {
+        return;
+    }
+    guard_core("tick", || node.tick(now_ms()));
+    while *next_tick <= monotonic_now {
+        *next_tick += DRIVER_TICK_INTERVAL;
+    }
+}
+
 /// One iteration of the raw-TCP accept loop: admit against the mesh cap (services-04), shedding the
 /// socket when over it, else spawn a per-connection `serve_tcp` handler that holds the slot guard for
 /// its lifetime. Extracted so the admit-or-shed decision is unit-testable over a loopback socket.
-fn spawn_tcp_conn(stream: TcpStream, ev_tx: &Sender<Ev>) {
+fn spawn_tcp_conn(stream: TcpStream, ev_tx: &EventTx) {
+    if !ev_tx.protocol_ready() {
+        drop(stream);
+        return;
+    }
     let Some(guard) = admit_conn() else {
         drop(stream); // services-04: shed over the connection cap rather than spawn unboundedly
         return;
@@ -1126,7 +1513,11 @@ fn spawn_tcp_conn(stream: TcpStream, ev_tx: &Sender<Ev>) {
 /// the cheap PENDING-peek budget and handed to `admit_and_serve_ws` on a worker thread, so the
 /// timeout-bounded peek/classify never stalls this accept path and the mesh cap is charged only after
 /// the kind is known. Extracted so the fast-path/admit decision is unit-testable.
-fn dispatch_ws_accept(stream: TcpStream, ev_tx: &Sender<Ev>) {
+fn dispatch_ws_accept(stream: TcpStream, ev_tx: &EventTx) {
+    if peek_is_livez(&stream) {
+        std::thread::spawn(move || serve_livez(stream));
+        return;
+    }
     if peek_is_healthz(&stream) {
         std::thread::spawn(move || serve_healthz(stream));
         return;
@@ -1163,7 +1554,10 @@ fn main() {
     let base_seed = base_identity.to_secret_bytes();
     let identity = regional_identity(base_identity, &base_seed, region.as_deref());
     let addr = identity.address();
-    let store = build_store(&firestore, &db, &addr);
+    let store = build_store(&firestore, &db, &addr)
+        .unwrap_or_else(|error| panic!("durable store failed readiness: {error}"));
+    let durability = store.durability_handle().unwrap_or_default();
+    let _ = DURABILITY.set(durability.clone());
     let mut node = Node::with_store(identity, store);
     configure_node(&mut node, advertise.as_deref());
     // Seed the node clock to wall time BEFORE serving. A relay's now_ms is 0 until the driver's
@@ -1203,7 +1597,7 @@ fn main() {
         region.as_deref(),
     );
 
-    let (tx, rx) = mpsc::channel::<Ev>();
+    let (tx, rx) = event_channel_with_durability(durability.clone());
 
     // Accept inbound TCP device/relay connections (one thread per connection).
     if let Some(addr) = listen {
@@ -1265,6 +1659,7 @@ fn main() {
             addr.to_vec(),
             known_relays.clone(),
             tx.clone(),
+            durability.clone(),
         )),
         _ => None,
     };
@@ -1285,21 +1680,25 @@ fn main() {
     }
 
     // Driver: the sole owner of the node + the per-link outgoing senders.
-    let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
-    // F-7: per-peer-identity Ev::Data budgets, owned by the driver like `writers` above.
-    let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+    let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
     let mut prev_peers: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    let mut last_stats_ms: u64 = 0;
+    let mut driver_schedule = DriverSchedule {
+        last_stats_ms: 0,
+        next_tick: Instant::now() + DRIVER_TICK_INTERVAL,
+        next_durability_probe: Instant::now() + DURABILITY_PROBE_INTERVAL,
+    };
     #[cfg(feature = "firestore")]
     let mut last_handoff_ms: u64 = 0;
+    #[cfg(feature = "firestore")]
+    let mut pending_wanted = Vec::new();
     loop {
         if !driver_step(
             &mut node,
             &mut writers,
-            &mut peer_rates,
+            &tx,
             &rx,
             &mut prev_peers,
-            &mut last_stats_ms,
+            &mut driver_schedule,
         ) {
             break;
         }
@@ -1307,17 +1706,26 @@ fn main() {
         // deliver locally, on a slow timer (the worker does the blocking Firestore I/O
         // off this thread, §28).
         #[cfg(feature = "firestore")]
-        if let Some(htx) = &handoff_tx {
-            let now = now_ms();
-            if now.saturating_sub(last_handoff_ms) >= HANDOFF_INTERVAL_MS {
-                last_handoff_ms = now;
-                let _ = htx.send(handoff::Snapshot {
-                    now_ms: now,
-                    devices: node.peers(),
-                    undeliverable: node.undeliverable_device_bundles(),
-                    spool: node.spoolable_private_bundles(),
-                    wanted: node.take_wanted_mailboxes(),
-                });
+        if durability.is_ready() {
+            if let Some(htx) = &handoff_tx {
+                let now = now_ms();
+                if now.saturating_sub(last_handoff_ms) >= HANDOFF_INTERVAL_MS {
+                    last_handoff_ms = now;
+                    if pending_wanted.is_empty() {
+                        pending_wanted = node.take_wanted_mailboxes();
+                    }
+                    let snapshot = handoff::Snapshot {
+                        now_ms: now,
+                        devices: node.peers(),
+                        undeliverable: node.undeliverable_device_bundles(),
+                        spool: node.spoolable_private_bundles(),
+                        wanted: pending_wanted.clone(),
+                    };
+                    match htx.try_send(snapshot) {
+                        Ok(()) | Err(TrySendError::Disconnected(_)) => pending_wanted.clear(),
+                        Err(TrySendError::Full(_)) => {}
+                    }
+                }
             }
         }
     }
@@ -1347,14 +1755,14 @@ const HANDOFF_INTERVAL_MS: u64 = 20_000;
 
 /// Drive one raw-TCP connection: a writer thread owns the write half and drains the
 /// outgoing channel; this thread reads length-framed packets off the read half.
-fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
+fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &EventTx) {
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
     let _ = stream.set_nodelay(true);
     let mut write_half = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
     };
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
     if ev_tx.send(Ev::Up(link, role, out_tx)).is_err() {
         return;
     }
@@ -1382,11 +1790,15 @@ fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
         if !frame_len_ok(n) {
             break; // frame too large; drop the connection
         }
+        let reservation = match ev_tx.reserve_data(link, n) {
+            Ok(reservation) => reservation,
+            Err(_) => break,
+        };
         let mut buf = vec![0u8; n];
         if read.read_exact(&mut buf).is_err() {
             break;
         }
-        if ev_tx.send(Ev::Data(link, buf)).is_err() {
+        if ev_tx.send_reserved_data(link, reservation, buf).is_err() {
             break;
         }
     }
@@ -1402,6 +1814,7 @@ fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &Sender<Ev>) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WsKind {
     Healthz,
+    Livez,
     LogStream,
     Upgrade,
     Empty,
@@ -1422,7 +1835,9 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
             let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
             // F-17: a real health probe, tied to the driver loop's heartbeat — distinct from the log
             // stream, which stays up even if the driver deadlocks and so is NOT a health signal.
-            if req.contains("get /healthz") {
+            if req.contains("get /livez") {
+                WsKind::Livez
+            } else if req.contains("get /healthz") || req.contains("get /readyz") {
                 WsKind::Healthz
             } else if req.contains("upgrade: websocket") {
                 WsKind::Upgrade
@@ -1449,11 +1864,14 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
 ///   * `LogStream`: charges the SMALL log budget only; if the log pool is full, shed.
 ///   * `Upgrade`  : a real mesh link. Charge the mesh budget now; if the mesh cap is full, shed.
 ///   * `Empty`    : nothing to serve. Drop.
-fn admit_and_serve_ws(stream: TcpStream, pending: ConnGuard, ev_tx: &Sender<Ev>) {
+fn admit_and_serve_ws(stream: TcpStream, pending: ConnGuard, ev_tx: &EventTx) {
     let kind = classify_ws_peek(&stream);
     // Classification done: release the transient pending-peek slot and charge the durable pool.
     drop(pending);
     match kind {
+        WsKind::Livez => {
+            serve_livez(stream);
+        }
         WsKind::Healthz => {
             serve_healthz(stream); // liveness probe: exempt from every budget
         }
@@ -1465,6 +1883,10 @@ fn admit_and_serve_ws(stream: TcpStream, pending: ConnGuard, ev_tx: &Sender<Ev>)
             serve_ws(stream, kind, ev_tx);
         }
         WsKind::Upgrade => {
+            if !ev_tx.protocol_ready() {
+                drop(stream);
+                return;
+            }
             let Some(_guard) = admit_conn() else {
                 drop(stream); // mesh cap full: a real mesh link sheds on the mesh budget
                 return;
@@ -1477,12 +1899,22 @@ fn admit_and_serve_ws(stream: TcpStream, pending: ConnGuard, ev_tx: &Sender<Ev>)
     }
 }
 
-fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
+fn ws_bearer_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+}
+
+fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &EventTx) {
     // The accept loop already peek-classified this connection and charged the right budget
     // (services-r3-01). Dispatch non-mesh shapes to their handlers; only a real upgrade continues
     // into the WS driver below. If we just closed non-WS GETs, Cloud Run would see a malformed/empty
     // response and recycle the instance in a loop, so a plain GET gets the live log stream instead.
     match kind {
+        WsKind::Livez => {
+            serve_livez(stream);
+            return;
+        }
         WsKind::Healthz => {
             serve_healthz(stream);
             return;
@@ -1496,10 +1928,7 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
     }
     // services-05: cap the WS message/frame size to match the raw-TCP bearer path, instead of
     // tungstenite's 64 MiB default, so neither transport accepts an oversized message.
-    let ws_config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME_BYTES))
-        .max_frame_size(Some(MAX_FRAME_BYTES));
-    let mut ws = match tungstenite::accept_with_config(stream, Some(ws_config)) {
+    let mut ws = match tungstenite::accept_with_config(stream, Some(ws_bearer_config())) {
         Ok(w) => w,
         Err(_) => return, // malformed upgrade
     };
@@ -1509,7 +1938,7 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
         .set_read_timeout(Some(Duration::from_millis(100)));
 
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
     if ev_tx.send(Ev::Up(link, Role::Responder, out_tx)).is_err() {
         return;
     }
@@ -1530,14 +1959,22 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
         if ws.flush().is_err() {
             break;
         }
+        let reservation = match ev_tx.reserve_data(link, MAX_FRAME_BYTES) {
+            Ok(reservation) => reservation,
+            Err(QueueAdmissionError::TimedOut) | Err(QueueAdmissionError::QueueFull) => continue,
+            Err(_) => break,
+        };
         match ws.read() {
             Ok(Message::Binary(b)) => {
-                if ev_tx.send(Ev::Data(link, b.to_vec())).is_err() {
+                if ev_tx
+                    .send_reserved_data(link, reservation, b.to_vec())
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {} // text/ping/pong/frame: tungstenite auto-replies to pings on flush
+            Ok(_) => drop(reservation), // control frames retain no producer bytes
             Err(tungstenite::Error::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -1557,15 +1994,16 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &Sender<Ev>) {
 /// single-thread read/drain interleave, as a non-blocking client (a TLS read timeout doesn't
 /// reliably surface as WouldBlock; non-blocking does — same fix as the endpoint dialer).
 #[cfg(feature = "firestore")]
-fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
+fn dial_peer(url: &str, ev_tx: &EventTx) {
     use tungstenite::stream::MaybeTlsStream;
-    let (mut ws, _resp) = match tungstenite::connect(url) {
-        Ok(c) => c,
-        Err(e) => {
-            netlog(format!("peer: {url} unreachable ({e})"));
-            return;
-        }
-    };
+    let (mut ws, _resp) =
+        match tungstenite::client::connect_with_config(url, Some(ws_bearer_config()), 3) {
+            Ok(c) => c,
+            Err(e) => {
+                netlog(format!("peer: {url} unreachable ({e})"));
+                return;
+            }
+        };
     match ws.get_ref() {
         MaybeTlsStream::Plain(s) => {
             let _ = s.set_nonblocking(true);
@@ -1576,7 +2014,7 @@ fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
         _ => {}
     }
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
     if ev_tx.send(Ev::Up(link, Role::Initiator, out_tx)).is_err() {
         return;
     }
@@ -1599,14 +2037,22 @@ fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
             Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => break,
         }
+        let reservation = match ev_tx.reserve_data(link, MAX_FRAME_BYTES) {
+            Ok(reservation) => reservation,
+            Err(QueueAdmissionError::TimedOut) | Err(QueueAdmissionError::QueueFull) => continue,
+            Err(_) => break,
+        };
         match ws.read() {
             Ok(Message::Binary(b)) => {
-                if ev_tx.send(Ev::Data(link, b.to_vec())).is_err() {
+                if ev_tx
+                    .send_reserved_data(link, reservation, b.to_vec())
+                    .is_err()
+                {
                     return;
                 }
             }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {}
+            Ok(_) => drop(reservation),
             Err(tungstenite::Error::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -1623,31 +2069,36 @@ fn dial_peer(url: &str, ev_tx: &Sender<Ev>) {
 /// Pick the store backend: durable per-node Firestore (scale-to-zero) when built with
 /// `--features firestore` and given a project, else local SQLite.
 #[cfg(feature = "firestore")]
-fn build_store(firestore: &Option<String>, db: &str, addr: &[u8]) -> Box<dyn Store> {
+fn build_store(
+    firestore: &Option<String>,
+    db: &str,
+    addr: &[u8],
+) -> std::result::Result<Box<dyn Store>, String> {
     if let Some(project) = firestore {
-        match FirestoreStore::open(project, addr) {
-            Ok(s) => {
-                println!("store: firestore (project {project})");
-                // stores-09: expose the mirror's dropped-op counter to /healthz so a degraded
-                // Firestore (writes being shed under backpressure) surfaces as unhealthy.
-                let _ = MIRROR_DROPPED.set(s.mirror_dropped_handle());
-                let _ = MIRROR_FAILED.set(s.mirror_failed_handle());
-                return Box::new(s);
-            }
-            Err(e) => eprintln!("firestore open failed ({e}); falling back to sqlite"),
-        }
+        let s = FirestoreStore::open(project, addr)
+            .map_err(|error| format!("firestore open failed for project {project}: {error}"))?;
+        println!("store: firestore (project {project})");
+        let _ = MIRROR_DROPPED.set(s.mirror_dropped_handle());
+        let _ = MIRROR_FAILED.set(s.mirror_failed_handle());
+        return Ok(Box::new(s));
     }
-    Box::new(SqliteStore::open(db).expect("open sqlite store"))
+    SqliteStore::open(db)
+        .map(|store| Box::new(store) as Box<dyn Store>)
+        .map_err(|error| format!("sqlite open failed: {error}"))
 }
 
 #[cfg(not(feature = "firestore"))]
-fn build_store(firestore: &Option<String>, db: &str, _addr: &[u8]) -> Box<dyn Store> {
+fn build_store(
+    firestore: &Option<String>,
+    db: &str,
+    _addr: &[u8],
+) -> std::result::Result<Box<dyn Store>, String> {
     if firestore.is_some() {
-        eprintln!(
-            "firestore support not compiled in (build with --features firestore); using sqlite"
-        );
+        return Err("firestore configured but support was not compiled in".into());
     }
-    Box::new(SqliteStore::open(db).expect("open sqlite store"))
+    SqliteStore::open(db)
+        .map(|store| Box::new(store) as Box<dyn Store>)
+        .map_err(|error| format!("sqlite open failed: {error}"))
 }
 
 /// Load the relay identity: from a 32-byte file (mounted secret) when given, else
@@ -1767,7 +2218,7 @@ mod backbone {
         addr: Vec<u8>,
         known_relays: Arc<Mutex<HashSet<String>>>,
         fanout: usize,
-        ev_tx: super::Sender<super::Ev>,
+        ev_tx: super::EventTx,
     ) {
         let reg = Arc::new(Registry::new(&project, &addr));
         let me = bs58::encode(&addr).into_string();
@@ -1886,7 +2337,12 @@ mod mailbox {
             data: &[u8],
             expires_at: u64,
         ) -> Result<(), String>;
-        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String>;
+        fn visit_mailbox<R>(
+            &self,
+            tag_b58: &str,
+            reserve: impl FnMut() -> Result<R, String>,
+            visit: impl FnMut(R, Vec<u8>, u64) -> Result<(), String>,
+        ) -> Result<(), String>;
         fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String>;
     }
 
@@ -1896,19 +2352,21 @@ mod mailbox {
         pub tag_b58: String,
         pub id: BundleId,
         pub bytes: Vec<u8>,
-        pub expires: u64,
     }
 
     /// §39 P5 spool + want-beacon, store-agnostic. Spools each un-routable private bundle by its
     /// mailbox-tag; for each wanted tag, pulls anything held under it, dedups by id, deletes the
     /// spool copy, and returns the bytes to re-ingest. `spooled`/`pulled` carry cross-cycle dedup.
-    pub fn process_mailbox<M: MailboxStore>(
+    pub fn process_mailbox<M: MailboxStore, R>(
         store: &M,
         spool: &[(BundleId, Tag, Vec<u8>, u64)],
         wanted: &[Tag],
         spooled: &mut HashMap<(BundleId, Tag), u64>,
         pulled: &mut HashMap<BundleId, u64>,
-    ) -> Vec<MailboxPull> {
+        mut reserve: impl FnMut() -> Result<R, String>,
+        mut offer: impl FnMut(MailboxPull, R) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut first_error = None;
         for (id, tag, bytes, expires) in spool {
             // services-r2-04: dedup value is the bundle's own expiry, so the caller can age-evict.
             if spooled.insert((*id, *tag), *expires).is_some() {
@@ -1924,6 +2382,9 @@ mod mailbox {
                     &tag_b58[..tag_b58.len().min(8)]
                 ));
                 spooled.remove(&(*id, *tag)); // let a later cycle retry
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             } else {
                 super::netlog_private(format!(
                     "spool: msg {} → mailbox {}",
@@ -1933,38 +2394,46 @@ mod mailbox {
             }
         }
 
-        let mut ingest = Vec::new();
         for tag in wanted {
             let tag_b58 = bs58::encode(tag).into_string();
-            let held = match store.list_mailbox(&tag_b58) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("spool: list_mailbox failed: {e}");
-                    continue;
-                }
-            };
-            for (bytes, expires) in held {
-                let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
-                    continue;
-                };
-                let id = b.id();
-                if !pulled.contains_key(&id) {
-                    // services-03: pull side of the spool/pull correlation; operator log only.
+            let visit_result =
+                store.visit_mailbox(&tag_b58, &mut reserve, |reservation, bytes, expires| {
+                    let Ok(bundle) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
+                        return Ok(());
+                    };
+                    let id = bundle.id();
+                    if pulled.contains_key(&id) {
+                        return Ok(());
+                    }
                     super::netlog_private(format!(
                         "want-beacon: pulled msg {} from mailbox {}",
                         super::short_b58(&id),
                         &tag_b58[..tag_b58.len().min(8)]
                     ));
-                    ingest.push(MailboxPull {
-                        tag_b58: tag_b58.clone(),
-                        id,
-                        bytes,
-                        expires,
-                    });
+                    let accepted = offer(
+                        MailboxPull {
+                            tag_b58: tag_b58.clone(),
+                            id,
+                            bytes,
+                        },
+                        reservation,
+                    )?;
+                    if accepted {
+                        pulled.insert(id, expires);
+                    }
+                    Ok(())
+                });
+            if let Err(error) = visit_result {
+                eprintln!("spool: list_mailbox failed: {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
         }
-        ingest
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     #[cfg(test)]
@@ -1997,20 +2466,50 @@ mod mailbox {
                     .insert(*id, data.to_vec());
                 Ok(())
             }
-            fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-                Ok(self
+            fn visit_mailbox<R>(
+                &self,
+                tag_b58: &str,
+                mut reserve: impl FnMut() -> Result<R, String>,
+                mut visit: impl FnMut(R, Vec<u8>, u64) -> Result<(), String>,
+            ) -> Result<(), String> {
+                let ids: Vec<_> = self
                     .boxes
                     .lock()
                     .unwrap()
                     .get(tag_b58)
-                    .map(|m| m.values().map(|v| (v.clone(), 0)).collect())
-                    .unwrap_or_default())
+                    .map(|mailbox| mailbox.keys().copied().collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    let reservation = reserve()?;
+                    let data = self
+                        .boxes
+                        .lock()
+                        .unwrap()
+                        .get(tag_b58)
+                        .and_then(|mailbox| mailbox.get(&id))
+                        .cloned();
+                    if let Some(data) = data {
+                        visit(reservation, data, 0)?;
+                    }
+                }
+                Ok(())
             }
             fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
                 if let Some(m) = self.boxes.lock().unwrap().get_mut(tag_b58) {
                     m.remove(id);
                 }
                 Ok(())
+            }
+        }
+
+        impl FakeMailbox {
+            fn mailbox_len(&self, tag: &Tag) -> usize {
+                self.boxes
+                    .lock()
+                    .unwrap()
+                    .get(&bs58::encode(tag).into_string())
+                    .map(HashMap::len)
+                    .unwrap_or(0)
             }
         }
 
@@ -2054,26 +2553,43 @@ mod mailbox {
 
             // Region A: no live gradient → spool the bundle. Its own dedup sets.
             let (mut sp_a, mut pl_a) = (HashMap::new(), HashMap::new());
-            let out_a = process_mailbox(
+            let mut out_a = Vec::new();
+            process_mailbox(
                 &store,
                 &[(id, tag, bytes.clone(), 0)],
                 &[],
                 &mut sp_a,
                 &mut pl_a,
-            );
+                || Ok(()),
+                |pull, ()| {
+                    out_a.push(pull);
+                    Ok(false)
+                },
+            )
+            .unwrap();
             assert!(out_a.is_empty(), "spooling ingests nothing");
             assert_eq!(
-                store
-                    .list_mailbox(&bs58::encode(tag).into_string())
-                    .unwrap()
-                    .len(),
+                store.mailbox_len(&tag),
                 1,
                 "bundle is durably spooled by mailbox-tag"
             );
 
             // Region B (DIFFERENT worker/dedup sets, SAME store): bob beacons → want-beacon pulls it.
             let (mut sp_b, mut pl_b) = (HashMap::new(), HashMap::new());
-            let out_b = process_mailbox(&store, &[], &[tag], &mut sp_b, &mut pl_b);
+            let mut out_b = Vec::new();
+            process_mailbox(
+                &store,
+                &[],
+                &[tag],
+                &mut sp_b,
+                &mut pl_b,
+                || Ok(()),
+                |pull, ()| {
+                    out_b.push(pull);
+                    Ok(false)
+                },
+            )
+            .unwrap();
             assert_eq!(
                 out_b.len(),
                 1,
@@ -2089,22 +2605,30 @@ mod mailbox {
 
             // The source remains until the driver accepts and durably flushes custody.
             assert_eq!(
-                store
-                    .list_mailbox(&bs58::encode(tag).into_string())
-                    .unwrap()
-                    .len(),
+                store.mailbox_len(&tag),
                 1,
                 "source retained before custody acknowledgement"
             );
             store
                 .delete_mailbox_bundle(&out_b[0].tag_b58, &out_b[0].id)
                 .unwrap();
-            pl_b.insert(out_b[0].id, out_b[0].expires);
+            pl_b.insert(out_b[0].id, 0);
             let (mut sp_c, mut pl_c) = (HashMap::new(), HashMap::new());
-            assert!(
-                process_mailbox(&store, &[], &[tag], &mut sp_c, &mut pl_c).is_empty(),
-                "no double-delivery on re-beacon"
-            );
+            let mut out_c = Vec::new();
+            process_mailbox(
+                &store,
+                &[],
+                &[tag],
+                &mut sp_c,
+                &mut pl_c,
+                || Ok(()),
+                |pull, ()| {
+                    out_c.push(pull);
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            assert!(out_c.is_empty(), "no double-delivery on re-beacon");
         }
 
         #[test]
@@ -2121,12 +2645,41 @@ mod mailbox {
                 &[],
                 &mut sp,
                 &mut pl,
-            );
-            let first = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
-            pl.insert(first[0].id, first[0].expires);
+                || Ok(()),
+                |_pull, ()| Ok(false),
+            )
+            .unwrap();
+            let mut first = Vec::new();
+            process_mailbox(
+                &store,
+                &[],
+                &[tag],
+                &mut sp,
+                &mut pl,
+                || Ok(()),
+                |pull, ()| {
+                    first.push(pull);
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            pl.insert(first[0].id, 0);
             // Re-insert into the store behind the worker's back to prove `pulled` dedup, not just deletion.
             let _ = store.spool_to_mailbox(&bs58::encode(tag).into_string(), &id, &bytes, 0);
-            let again = process_mailbox(&store, &[], &[tag], &mut sp, &mut pl);
+            let mut again = Vec::new();
+            process_mailbox(
+                &store,
+                &[],
+                &[tag],
+                &mut sp,
+                &mut pl,
+                || Ok(()),
+                |pull, ()| {
+                    again.push(pull);
+                    Ok(false)
+                },
+            )
+            .unwrap();
             assert!(
                 again.is_empty(),
                 "a bundle id already pulled by this worker is not re-ingested"
@@ -2147,7 +2700,7 @@ mod mailbox {
 #[cfg(feature = "firestore")]
 mod handoff {
     use std::collections::{HashMap, HashSet};
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::mpsc::{self, SyncSender};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2156,7 +2709,7 @@ mod handoff {
     use hop_store_firestore::Presence;
 
     use super::mailbox::{evict_expired, process_mailbox, MailboxStore};
-    use super::{now_ms, region_node_b58, Ev};
+    use super::{now_ms, region_node_b58, DurabilityHandle, Ev, EventTx};
 
     /// A device-presence record is trusted this long after check-in (matches the
     /// registry TTL — beyond it, we don't know where the device is, so we don't hand off).
@@ -2186,18 +2739,20 @@ mod handoff {
         base_seed: [u8; 32],
         addr: Vec<u8>,
         known_relays: Arc<Mutex<HashSet<String>>>,
-        ev_tx: Sender<Ev>,
-    ) -> Sender<Snapshot> {
+        ev_tx: EventTx,
+        durability: DurabilityHandle,
+    ) -> SyncSender<Snapshot> {
         let me = bs58::encode(&addr).into_string();
 
         // Worker: consume driver snapshots, record device presence, and hand undeliverable
         // bundles into their destination region's partition.
-        let (snap_tx, snap_rx) = mpsc::channel::<Snapshot>();
+        let (snap_tx, snap_rx) = mpsc::sync_channel::<Snapshot>(1);
         {
             let presence = Presence::new(&project);
             let region = region.clone();
             let known_relays = known_relays.clone();
             let ev_tx = ev_tx.clone();
+            let durability = durability.clone();
             std::thread::spawn(move || {
                 // Bundles already handed off (id → dest region), so we don't re-write them every
                 // cycle. services-r2-04: each dedup entry carries the bundle's own `expires_at`, so
@@ -2213,6 +2768,9 @@ mod handoff {
                 let mut spooled: HashMap<(BundleId, Tag), u64> = HashMap::new();
                 let mut pulled: HashMap<BundleId, u64> = HashMap::new();
                 for snap in snap_rx {
+                    if !durability.is_ready() {
+                        continue;
+                    }
                     evict_expired(&mut handed, snap.now_ms);
                     evict_expired(&mut spooled, snap.now_ms);
                     evict_expired(&mut pulled, snap.now_ms);
@@ -2223,6 +2781,7 @@ mod handoff {
                             continue;
                         }
                         if let Err(e) = presence.set_presence(&b58, &region, snap.now_ms) {
+                            durability.mark_not_ready();
                             eprintln!("handoff: set_presence failed: {e}");
                         }
                     }
@@ -2234,6 +2793,7 @@ mod handoff {
                                 Ok(Some(r)) => r,
                                 Ok(None) => continue, // unknown/stale — nowhere to hand off yet
                                 Err(e) => {
+                                    durability.mark_not_ready();
                                     eprintln!("handoff: region_of failed: {e}");
                                     continue;
                                 }
@@ -2246,6 +2806,7 @@ mod handoff {
                         }
                         let dest_node = region_node_b58(&base_seed, &dst_region);
                         if let Err(e) = presence.put_bundle_to(&dest_node, id, bytes, *expires) {
+                            durability.mark_not_ready();
                             // services-03: bundle id + destination region is per-message metadata.
                             super::netlog_private(format!(
                                 "handoff FAILED: msg {} → {} (region {dst_region}): {e}",
@@ -2264,28 +2825,41 @@ mod handoff {
 
                     // §39 P5 spool + want-beacon, extracted into a store-agnostic function so the
                     // cross-region round trip is unit-testable with a fake shared mailbox (F-18).
-                    for pull in process_mailbox(
+                    let mailbox_result = process_mailbox(
                         &presence,
                         &snap.spool,
                         &snap.wanted,
                         &mut spooled,
                         &mut pulled,
-                    ) {
-                        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
-                        if ev_tx.send(Ev::IngestCustody(pull.bytes, ack_tx)).is_err() {
-                            return; // driver gone
-                        }
-                        if ack_rx.recv_timeout(Duration::from_secs(6)) == Ok(true) {
-                            if <Presence as MailboxStore>::delete_mailbox_bundle(
+                        || {
+                            ev_tx
+                                .reserve_durable()
+                                .map_err(|error| format!("durable reservation failed: {error:?}"))
+                        },
+                        |pull, reservation| {
+                            let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+                            ev_tx
+                                .send_reserved_durable(
+                                    reservation,
+                                    Ev::IngestCustody(pull.bytes, ack_tx),
+                                )
+                                .map_err(|error| {
+                                    format!("durable ingest admission failed: {error:?}")
+                                })?;
+                            if ack_rx.recv_timeout(Duration::from_secs(6)) != Ok(true) {
+                                return Ok(false);
+                            }
+                            <Presence as MailboxStore>::delete_mailbox_bundle(
                                 &presence,
                                 &pull.tag_b58,
                                 &pull.id,
-                            )
-                            .is_ok()
-                            {
-                                pulled.insert(pull.id, pull.expires);
-                            }
-                        }
+                            )?;
+                            Ok(true)
+                        },
+                    );
+                    if let Err(error) = mailbox_result {
+                        durability.mark_not_ready();
+                        eprintln!("handoff: mailbox custody failed: {error}");
                     }
                 }
             });
@@ -2295,6 +2869,7 @@ mod handoff {
         // while we're already up get ingested (a cold start gets them via rehydrate).
         {
             let presence = Presence::new(&project);
+            let durability = durability.clone();
             std::thread::spawn(move || {
                 // services-r2-04: the reload dedup set was an unbounded HashSet<BundleId> that grew
                 // for the whole process lifetime (every handoff ever re-read stayed remembered). Give
@@ -2304,21 +2879,36 @@ mod handoff {
                 let mut ingested: HashMap<BundleId, u64> = HashMap::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(RELOAD_SECS));
+                    if !durability.is_ready() {
+                        continue;
+                    }
                     evict_expired(&mut ingested, now_ms());
-                    match presence.list_bundles_of(&me) {
-                        Ok(bundles) => {
-                            for (bytes, expires) in bundles {
-                                if let Ok(b) = hop_core::bundle::Bundle::from_bytes(&bytes) {
-                                    if ingested.insert(b.id(), expires).is_some() {
-                                        continue; // already pushed to the driver
-                                    }
-                                    if ev_tx.send(Ev::Ingest(bytes)).is_err() {
-                                        return; // driver gone
-                                    }
-                                }
+                    let result = presence.visit_bundles_of(
+                        &me,
+                        || {
+                            ev_tx
+                                .reserve_durable()
+                                .map_err(|error| format!("durable reservation failed: {error:?}"))
+                        },
+                        |reservation, bytes, expires| {
+                            let Ok(bundle) = hop_core::bundle::Bundle::from_bytes(&bytes) else {
+                                return Ok(());
+                            };
+                            if ingested.contains_key(&bundle.id()) {
+                                return Ok(());
                             }
-                        }
-                        Err(e) => eprintln!("handoff: partition reload failed: {e}"),
+                            ev_tx
+                                .send_reserved_durable(reservation, Ev::Ingest(bytes))
+                                .map_err(|error| {
+                                    format!("durable ingest admission failed: {error:?}")
+                                })?;
+                            ingested.insert(bundle.id(), expires);
+                            Ok(())
+                        },
+                    );
+                    if let Err(e) = result {
+                        durability.mark_not_ready();
+                        eprintln!("handoff: partition reload failed: {e}");
                     }
                 }
             });
@@ -2339,8 +2929,13 @@ mod handoff {
         ) -> Result<(), String> {
             Presence::spool_to_mailbox(self, tag_b58, id, data, expires_at)
         }
-        fn list_mailbox(&self, tag_b58: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
-            Presence::list_mailbox(self, tag_b58)
+        fn visit_mailbox<R>(
+            &self,
+            tag_b58: &str,
+            reserve: impl FnMut() -> Result<R, String>,
+            visit: impl FnMut(R, Vec<u8>, u64) -> Result<(), String>,
+        ) -> Result<(), String> {
+            Presence::visit_mailbox(self, tag_b58, reserve, visit)
         }
         fn delete_mailbox_bundle(&self, tag_b58: &str, id: &BundleId) -> Result<(), String> {
             Presence::delete_mailbox_bundle(self, tag_b58, id)
@@ -2393,7 +2988,7 @@ mod secret_perms_tests {
 
 #[cfg(test)]
 mod log_privacy_tests {
-    use super::{netlog, netlog_private, LogHub, LogInner};
+    use super::{netlog, netlog_private, LogHub, LogInner, MAX_LOG_SUBSCRIBER_LINES};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2428,6 +3023,29 @@ mod log_privacy_tests {
             rx.recv_timeout(std::time::Duration::from_millis(100))
                 .is_err(),
             "private per-message metadata must never reach a public viewer"
+        );
+    }
+
+    #[test]
+    fn slow_log_subscriber_has_a_bounded_nonblocking_queue() {
+        let hub = fresh_hub();
+        let (_who, _backlog, rx) = hub.subscribe();
+        for i in 0..(MAX_LOG_SUBSCRIBER_LINES + 50) {
+            hub.emit(format!("line {i}"));
+        }
+
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, MAX_LOG_SUBSCRIBER_LINES);
+
+        hub.emit("after drain".to_string());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .contains("after drain"),
+            "the subscriber remains live after shedding overflow lines"
         );
     }
 
@@ -2484,14 +3102,20 @@ mod control_path_tests {
     // exact surface that keeps a degraded/attacked relay from exhausting threads or memory, yet had
     // no direct tests. These exercise them so a regression fails a test, not CI.
     use super::{
-        admit_conn, admit_log_conn, frame_len_ok, peek_is_healthz, MAX_CONNS, MAX_FRAME_BYTES,
-        MAX_LOG_CONNS,
+        admit_conn, admit_log_conn, event_channel, frame_len_ok, peek_is_healthz, MAX_CONNS,
+        MAX_FRAME_BYTES, MAX_LOG_CONNS,
     };
     use std::sync::Mutex;
 
     // These tests all mutate the process-global connection counters, so they must not run
     // concurrently with each other. Serialize them on one lock (Rust runs test fns in parallel).
     static CONN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_conn_tests() -> std::sync::MutexGuard<'static, ()> {
+        CONN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn peek_is_healthz_fast_paths_a_probe_and_never_blocks_on_a_slowloris() {
@@ -2580,7 +3204,7 @@ mod control_path_tests {
 
     #[test]
     fn admit_conn_sheds_over_the_connection_cap() {
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
         // Over MAX_CONNS, admit_conn returns None (the socket is shed) instead of spawning a handler
         // thread; dropping a guard frees its slot so the next connection is admitted again.
         let mut guards = Vec::new();
@@ -2612,7 +3236,7 @@ mod control_path_tests {
         // (WS device/relay link) must STILL be admitted, because log viewers charge a separate pool
         // and can never touch the mesh budget. Before the fix, both shared MAX_CONNS, so N idle
         // viewers filled the pool and this admit_conn() would have returned None (starvation).
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
         let mut log_guards = Vec::new();
         for _ in 0..MAX_LOG_CONNS {
             log_guards.push(admit_log_conn().expect("log viewer admitted under the log cap"));
@@ -2648,56 +3272,32 @@ mod control_path_tests {
         // short deadline (test seam), serve_log_stream emits its header/note then closes the socket
         // when LOG_STREAM_MAX_MS elapses, so the reader observes EOF (read returns 0). Before the
         // fix, serve_log_stream looped forever with no total deadline.
-        use super::serve_log_stream;
-        use std::io::{Read, Write};
+        use super::serve_log_stream_for;
+        use std::io::Write;
         use std::net::{TcpListener, TcpStream};
 
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
-        std::env::set_var("HOP_LOG_STREAM_MAX_MS", "300");
+        let _lock = lock_conn_tests();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            serve_log_stream(sock); // returns only when the deadline closes the stream
+            serve_log_stream_for(sock, 300);
+            done_tx.send(()).unwrap();
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-
-        // Read until EOF; the server must close within ~the deadline (not hang forever).
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
-        let mut saw_header = false;
-        loop {
-            match client.read(&mut buf) {
-                Ok(0) => break, // EOF: server closed at the deadline
-                Ok(n) => {
-                    if String::from_utf8_lossy(&buf[..n]).contains("hop relay") {
-                        saw_header = true;
-                    }
-                }
-                // The server dropping the socket with unread buffered bytes surfaces as an
-                // RST (ConnectionReset) rather than a clean EOF on some platforms. Either way the
-                // connection is CLOSED at the deadline, which is exactly what we assert.
-                Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
-                Err(e) => panic!("read failed unexpectedly: {e}"),
-            }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(4),
-                "log stream did not close at its deadline (would camp a slot forever)"
-            );
-        }
-        // The core proof is the timely close above; the header is best-effort (an RST can drop
-        // buffered bytes before the client drains them, but the connection still closed on time).
-        let _ = saw_header;
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("log stream handler did not return at its deadline");
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        drop(client);
         server.join().unwrap();
-        std::env::remove_var("HOP_LOG_STREAM_MAX_MS");
     }
 
     #[test]
@@ -2779,9 +3379,8 @@ mod control_path_tests {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::Ordering;
-        use std::sync::mpsc;
 
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
         assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), 0, "clean start (mesh)");
         assert_eq!(
             ACTIVE_LOG_CONNS.load(Ordering::SeqCst),
@@ -2807,7 +3406,7 @@ mod control_path_tests {
             });
             let (sock, _) = listener.accept().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(30)); // let the client send
-            let (ev_tx, _ev_rx) = mpsc::channel();
+            let (ev_tx, _ev_rx) = event_channel();
             std::thread::spawn(move || {
                 admit_and_serve_ws(sock, pending, &ev_tx);
             })
@@ -2883,7 +3482,7 @@ mod control_path_tests {
         });
         let (sock, _) = listener.accept().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let (ev_tx, _ev_rx) = mpsc::channel();
+        let (ev_tx, _ev_rx) = event_channel();
         let worker = std::thread::spawn(move || admit_and_serve_ws(sock, pending, &ev_tx));
         // Give the worker time to classify + reconcile onto the log pool, then observe mid-serve.
         std::thread::sleep(std::time::Duration::from_millis(80));
@@ -2927,14 +3526,13 @@ mod control_path_tests {
         use super::{spawn_tcp_conn, Ev, ACTIVE_CONNS};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::Ordering;
-        use std::sync::mpsc;
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
         assert_eq!(ACTIVE_CONNS.load(Ordering::SeqCst), 0, "clean start");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).unwrap();
         let (sock, _) = listener.accept().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         spawn_tcp_conn(sock, &ev_tx);
         let up = ev_rx
             .recv_timeout(std::time::Duration::from_secs(3))
@@ -2967,8 +3565,7 @@ mod control_path_tests {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::Ordering;
-        use std::sync::mpsc;
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
 
         // (a) healthz fast-path: an HTTP response comes back and no slot is charged.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2983,7 +3580,7 @@ mod control_path_tests {
         });
         let (sock, _) = listener.accept().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(25)); // let the probe's bytes arrive
-        let (ev_tx, _ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, _ev_rx) = event_channel();
         dispatch_ws_accept(sock, &ev_tx);
         let resp = probe.join().unwrap();
         assert!(
@@ -3014,7 +3611,7 @@ mod control_path_tests {
         });
         let (sock2, _) = listener2.accept().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let (ev_tx2, ev_rx2) = mpsc::channel::<Ev>();
+        let (ev_tx2, ev_rx2) = event_channel();
         dispatch_ws_accept(sock2, &ev_tx2);
         let up = ev_rx2
             .recv_timeout(std::time::Duration::from_secs(3))
@@ -3049,8 +3646,7 @@ mod control_path_tests {
         use std::io::Write;
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::Ordering;
-        use std::sync::mpsc;
-        let _lock = CONN_TEST_LOCK.lock().unwrap();
+        let _lock = lock_conn_tests();
 
         // Send `req`, run admit_and_serve_ws on the accepted socket, and report whether it produced an
         // Ev::Up (i.e. was admitted rather than shed). Raw bytes (no tungstenite handshake) so a shed
@@ -3067,7 +3663,7 @@ mod control_path_tests {
             });
             let (sock, _) = listener.accept().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(20)); // let the request bytes arrive
-            let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+            let (ev_tx, ev_rx) = event_channel();
             std::thread::spawn(move || admit_and_serve_ws(sock, pending, &ev_tx))
                 .join()
                 .unwrap();
@@ -3467,30 +4063,59 @@ mod healthz_tests {
 
     #[test]
     fn healthz_status_reports_stale_degraded_and_healthy() {
-        // The pure decision behind serve_healthz. Before the first tick (last=0) => 503 stale; a fresh
-        // tick with dropped mirror writes => 200 but "degraded"; a fresh tick with no drops => plain
-        // 200 "ok"; and a tick older than the stale window => 503 stale (restart the wedged instance).
+        // Readiness requires both a fresh driver tick and durable custody. Liveness is tested
+        // separately because a backend outage must stop traffic without causing restart churn.
         assert_eq!(
-            healthz_status(0, 1_000_000, 0, 0),
+            healthz_status(0, 1_000_000, DurabilityReadiness::Ready, 0, 0, 0),
             ("503 Service Unavailable", "stale".to_string())
         );
-        let (s, b) = healthz_status(1_000_000, 1_000_500, 7, 0);
-        assert_eq!(s, "200 OK");
+        let (s, b) = healthz_status(1_000_000, 1_000_500, DurabilityReadiness::NotReady, 0, 7, 0);
+        assert_eq!(s, "503 Service Unavailable");
         assert_eq!(
-            b, "ok degraded: mirror_dropped=7 mirror_failed=0",
-            "a dropping mirror is reported, still 200"
+            b, "not ready: durability=NotReady unreconciled=0 mirror_rejected=7 mirror_failed=0",
+            "a rejected durable write makes the relay unready"
         );
-        let (s, b) = healthz_status(1_000_000, 1_000_500, 0, 2);
-        assert_eq!(s, "200 OK");
-        assert_eq!(b, "ok degraded: mirror_dropped=0 mirror_failed=2");
+        let (s, b) = healthz_status(
+            1_000_000,
+            1_000_500,
+            DurabilityReadiness::Quarantined,
+            1,
+            0,
+            2,
+        );
+        assert_eq!(s, "503 Service Unavailable");
         assert_eq!(
-            healthz_status(1_000_000, 1_000_500, 0, 0),
+            b,
+            "not ready: durability=Quarantined unreconciled=1 mirror_rejected=0 mirror_failed=2"
+        );
+        assert_eq!(
+            healthz_status(1_000_000, 1_000_500, DurabilityReadiness::Ready, 0, 0, 0,),
             ("200 OK", "ok".to_string())
         );
         assert_eq!(
-            healthz_status(1_000_000, 1_000_000 + HEALTHZ_STALE_MS + 1, 0, 0),
+            healthz_status(
+                1_000_000,
+                1_000_000 + HEALTHZ_STALE_MS + 1,
+                DurabilityReadiness::Ready,
+                0,
+                0,
+                0,
+            ),
             ("503 Service Unavailable", "stale".to_string()),
             "a tick older than the stale window is a restart-worthy 503"
+        );
+    }
+
+    #[test]
+    fn livez_only_tracks_the_driver_heartbeat() {
+        assert_eq!(
+            livez_status(0, 1_000_000),
+            ("503 Service Unavailable", "stale")
+        );
+        assert_eq!(livez_status(1_000_000, 1_000_500), ("200 OK", "live"));
+        assert_eq!(
+            livez_status(1_000_000, 1_000_000 + HEALTHZ_STALE_MS + 1),
+            ("503 Service Unavailable", "stale")
         );
     }
 
@@ -3570,7 +4195,7 @@ mod tcp_framing_tests {
     fn run_serve_tcp(client_writes: impl FnOnce(&mut TcpStream) + Send + 'static) -> Vec<Ev> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             serve_tcp(sock, Role::Responder, &ev_tx);
@@ -3636,7 +4261,7 @@ mod tcp_framing_tests {
         // only assert that SOME health HTTP response is produced, whatever the current tick state.)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, _ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, _ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             serve_ws(sock, WsKind::Healthz, &ev_tx);
@@ -3664,7 +4289,7 @@ mod tcp_framing_tests {
         // handler. The driver channel receives NO Up event for an Empty connection.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             serve_ws(sock, WsKind::Empty, &ev_tx);
@@ -3878,39 +4503,18 @@ mod driver_tests {
     #[test]
     fn apply_event_tracks_the_writer_table_across_up_data_down() {
         let mut node = test_node();
-        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
-        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
-        let (out_tx, _out_rx) = mpsc::channel();
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Up(7, Role::Responder, out_tx),
-        );
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
+        let (out_tx, _out_rx) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        apply_event(&mut node, &mut writers, Ev::Up(7, Role::Responder, out_tx));
         assert!(writers.contains_key(&7), "Up registers the link's writer");
         // Garbage link bytes are tolerated (the node just fails to parse a frame); the table is intact.
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Data(7, vec![0u8, 1, 2, 3]),
-        );
+        apply_event(&mut node, &mut writers, Ev::Data(7, vec![0u8, 1, 2, 3]));
         assert!(
             writers.contains_key(&7),
             "Data leaves the writer table alone"
         );
-        // The pre-auth Data frame above was charged to the single shared PreAuth bucket, not a per-link
-        // entry (F-18b): so there is exactly one rate key and it is PreAuth.
-        assert!(
-            peer_rates.contains_key(&PeerRateKey::PreAuth),
-            "F-7: an unauthenticated Data frame is charged to the shared PreAuth bucket"
-        );
-        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Down(7));
+        apply_event(&mut node, &mut writers, Ev::Down(7));
         assert!(!writers.contains_key(&7), "Down removes the link's writer");
-        assert!(
-            peer_rates.contains_key(&PeerRateKey::PreAuth),
-            "F-18b: Down does NOT reset the shared PreAuth budget (a reconnect can't dodge the cap)"
-        );
     }
 
     // A Store that panics on put, to prove apply_event's guard_core wrapper (F-2) turns a core panic
@@ -3944,6 +4548,108 @@ mod driver_tests {
         fn set_copies(&mut self, id: &hop_core::bundle::BundleId, copies: u16) {
             self.0.set_copies(id, copies)
         }
+        fn apply_kv_batch(
+            &mut self,
+            mutations: &[hop_core::store::KvMutation],
+        ) -> std::result::Result<(), String> {
+            self.0.apply_kv_batch(mutations)
+        }
+        fn put_kv_critical(
+            &mut self,
+            key: &str,
+            value: Vec<u8>,
+        ) -> std::result::Result<(), String> {
+            self.0.put_kv_critical(key, value)
+        }
+        fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+            self.0.remove_kv_critical(key)
+        }
+    }
+
+    struct ReadinessStore {
+        inner: MemoryStore,
+        durability: DurabilityHandle,
+        probe_allowed: bool,
+        prunes: Option<Arc<AtomicU64>>,
+    }
+
+    impl Store for ReadinessStore {
+        fn put(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.put(bundle, now_ms)
+        }
+        fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+            self.inner.rehydrate(bundle, now_ms)
+        }
+        fn get(&self, id: &BundleId) -> Option<Bundle> {
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+            self.inner.remove(id)
+        }
+        fn seen(&self, id: &BundleId) -> bool {
+            self.inner.seen(id)
+        }
+        fn contains(&self, id: &BundleId) -> bool {
+            self.inner.contains(id)
+        }
+        fn have(&self) -> hop_core::store::HaveSet {
+            self.inner.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.inner.prune(now_ms);
+            if let Some(prunes) = &self.prunes {
+                prunes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        fn split_copies(&mut self, id: &BundleId) -> u16 {
+            self.inner.split_copies(id)
+        }
+        fn set_copies(&mut self, id: &BundleId, copies: u16) {
+            self.inner.set_copies(id, copies)
+        }
+        fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+            self.inner.seen_expiry(id)
+        }
+        fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+            self.inner.put_kv(key, value)
+        }
+        fn apply_kv_batch(
+            &mut self,
+            mutations: &[hop_core::store::KvMutation],
+        ) -> std::result::Result<(), String> {
+            self.inner.apply_kv_batch(mutations)
+        }
+        fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+            self.inner.get_kv(key)
+        }
+        fn remove_kv(&mut self, key: &str) {
+            self.inner.remove_kv(key)
+        }
+        fn list_kv_page(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Vec<(String, Vec<u8>)> {
+            self.inner.list_kv_page(prefix, after, limit)
+        }
+        fn durability_status(&self) -> DurabilityReadiness {
+            self.durability.status()
+        }
+        fn durability_handle(&self) -> Option<DurabilityHandle> {
+            Some(self.durability.clone())
+        }
+        fn probe_durability(&mut self) -> std::result::Result<(), String> {
+            let generation = self.durability.begin_recovery();
+            if !self.probe_allowed {
+                self.durability.mark_not_ready();
+                return Err("probe still denied".into());
+            }
+            if !self.durability.mark_ready_if_reconciled(generation) {
+                return Err("unreconciled mutation remains".into());
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -3955,14 +4661,247 @@ mod driver_tests {
     }
 
     #[test]
+    fn runtime_degradation_refuses_custody_ack_and_closes_existing_protocol_links() {
+        let _lock = lock_driver_statics();
+        let durability = DurabilityHandle::ready();
+        let store = ReadinessStore {
+            inner: MemoryStore::new(),
+            durability: durability.clone(),
+            probe_allowed: false,
+            prunes: None,
+        };
+        let mut node = Node::with_store(Identity::generate(), store);
+        let (tx, rx) = event_channel_with_durability(durability.clone());
+        let (writer, writer_rx) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        let mut writers = HashMap::new();
+        apply_event(&mut node, &mut writers, Ev::Up(44, Role::Responder, writer));
+        assert!(writers.contains_key(&44));
+
+        durability.mark_not_ready();
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        apply_event(
+            &mut node,
+            &mut writers,
+            Ev::IngestCustody(vec![1, 2, 3], ack_tx),
+        );
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        assert_eq!(
+            tx.try_send_data(44, vec![1]),
+            Err(QueueAdmissionError::NotReady),
+            "existing producers cannot enqueue while custody is degraded"
+        );
+
+        let mut previous = std::collections::HashSet::new();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: 0,
+            next_tick: Instant::now() + DRIVER_TICK_INTERVAL,
+            next_durability_probe: Instant::now() + DURABILITY_PROBE_INTERVAL,
+        };
+        assert!(driver_step(
+            &mut node,
+            &mut writers,
+            &tx,
+            &rx,
+            &mut previous,
+            &mut schedule,
+        ));
+        assert!(writers.is_empty());
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn definitive_runtime_failure_recovers_admission_after_periodic_probe() {
+        let _lock = lock_driver_statics();
+        let durability = DurabilityHandle::not_ready();
+        let store = ReadinessStore {
+            inner: MemoryStore::new(),
+            durability: durability.clone(),
+            probe_allowed: true,
+            prunes: None,
+        };
+        let mut node = Node::with_store(Identity::generate(), store);
+        let (tx, rx) = event_channel_with_durability(durability.clone());
+        let mut writers = HashMap::new();
+        let mut previous = std::collections::HashSet::new();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: 0,
+            next_tick: Instant::now(),
+            next_durability_probe: Instant::now(),
+        };
+        tx.send(Ev::Down(999)).unwrap();
+        assert!(driver_step(
+            &mut node,
+            &mut writers,
+            &tx,
+            &rx,
+            &mut previous,
+            &mut schedule,
+        ));
+        assert_eq!(durability.status(), DurabilityReadiness::Ready);
+        let (writer, _reader) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        assert!(tx.send(Ev::Up(45, Role::Responder, writer)).is_ok());
+    }
+
+    #[test]
+    fn unreconciled_runtime_failure_refuses_recovery_and_new_admission() {
+        let _lock = lock_driver_statics();
+        let durability = DurabilityHandle::ready();
+        durability.quarantine();
+        let store = ReadinessStore {
+            inner: MemoryStore::new(),
+            durability: durability.clone(),
+            probe_allowed: true,
+            prunes: None,
+        };
+        let mut node = Node::with_store(Identity::generate(), store);
+        let (tx, rx) = event_channel_with_durability(durability.clone());
+        let mut writers = HashMap::new();
+        let mut previous = std::collections::HashSet::new();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: 0,
+            next_tick: Instant::now(),
+            next_durability_probe: Instant::now(),
+        };
+        assert!(driver_step(
+            &mut node,
+            &mut writers,
+            &tx,
+            &rx,
+            &mut previous,
+            &mut schedule,
+        ));
+        assert_eq!(durability.status(), DurabilityReadiness::Quarantined);
+        assert_eq!(durability.unreconciled(), 1);
+        let (writer, _reader) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        assert_eq!(
+            tx.send(Ev::Up(46, Role::Responder, writer)),
+            Err(QueueAdmissionError::NotReady)
+        );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn one_hundred_twenty_eight_firestore_producers_share_the_event_byte_ceiling() {
+        let durability = DurabilityHandle::ready();
+        let (tx, rx) = event_channel_with_durability(durability);
+        let barrier = Arc::new(std::sync::Barrier::new(129));
+        let mut workers = Vec::new();
+        for _ in 0..128 {
+            let tx = tx.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                tx.queue
+                    .try_reserve(EventSource::Durable, FIRESTORE_READ_RESERVATION_BYTES)
+                    .ok()
+            }));
+        }
+        barrier.wait();
+        let reservations: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            reservations.len(),
+            MAX_EVENT_SOURCE_BYTES / FIRESTORE_READ_RESERVATION_BYTES,
+            "durable producers are limited by their shared source-byte budget"
+        );
+        assert!(tx.usage().1 <= MAX_EVENT_QUEUE_BYTES);
+        drop(reservations);
+        assert_eq!(tx.usage(), (0, 0));
+        assert!(
+            tx.reserve_durable().is_ok(),
+            "released capacity is reusable"
+        );
+        drop(rx);
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn replenished_durable_producers_cannot_starve_repeated_tick_or_total_byte_deadlines() {
+        let durability = DurabilityHandle::ready();
+        let prunes = Arc::new(AtomicU64::new(0));
+        let store = ReadinessStore {
+            inner: MemoryStore::new(),
+            durability: durability.clone(),
+            probe_allowed: true,
+            prunes: Some(prunes.clone()),
+        };
+        let mut node = Node::with_store(Identity::generate(), store);
+        let (tx, rx) = event_channel_with_durability(durability);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let produced = Arc::new(AtomicU64::new(0));
+        let mut producers = Vec::new();
+        for link in 0..32u64 {
+            let producer = tx.clone();
+            let stop = stop.clone();
+            let produced = produced.clone();
+            producers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if let Ok(reservation) = producer.queue.reserve_timeout(
+                        EventSource::Durable,
+                        FIRESTORE_READ_RESERVATION_BYTES,
+                        Duration::from_millis(20),
+                    ) {
+                        if reservation.try_send(Ev::Down(link)).is_ok() {
+                            produced.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                }
+            }));
+        }
+
+        let mut writers = HashMap::new();
+        let mut previous = std::collections::HashSet::new();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: now_ms(),
+            next_tick: Instant::now(),
+            next_durability_probe: Instant::now() + DURABILITY_PROBE_INTERVAL,
+        };
+        for deadline in 1..=4 {
+            schedule.next_tick = Instant::now();
+            assert!(driver_step(
+                &mut node,
+                &mut writers,
+                &tx,
+                &rx,
+                &mut previous,
+                &mut schedule,
+            ));
+            assert!(
+                prunes.load(Ordering::Acquire) >= deadline,
+                "continuously replenished producers did not starve tick deadline {deadline}"
+            );
+            let (_, queued_and_reserved) = tx.usage();
+            assert!(queued_and_reserved <= MAX_EVENT_QUEUE_BYTES);
+            assert!(
+                FIRESTORE_STARTUP_MAX_BYTES.saturating_add(queued_and_reserved)
+                    <= MAX_RELAY_QUEUED_RESERVED_STARTUP_BYTES,
+                "startup plus queued and reserved bytes exceeded the relay aggregate ceiling"
+            );
+        }
+
+        stop.store(true, Ordering::Release);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        assert!(
+            produced.load(Ordering::Acquire) > MAX_EVENT_BATCH as u64,
+            "producers replenished beyond one driver batch"
+        );
+    }
+
+    #[test]
     fn apply_event_survives_a_core_panic_on_hostile_bytes() {
         // The whole point of F-2: a core panic while processing an ingested bundle must NOT kill the
         // driver. Back the node with a store that panics on put; feed a valid bundle through Ev::Ingest;
         // apply_event must return normally (guard_core swallowed the panic). Revert-proof: drop the
         // guard_core wrapper around node.ingest and this test unwinds through apply_event and fails.
         let mut node = Node::with_store(Identity::generate(), PanicOnPut(MemoryStore::new()));
-        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
-        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
         let recipient = Identity::generate();
         let spk = recipient.derive_prekey();
         let bytes = {
@@ -3982,14 +4921,9 @@ mod driver_tests {
             .unwrap()
         };
         // If node.ingest -> store.put panics and is NOT caught, this call unwinds and the test fails.
-        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Ingest(bytes));
+        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
         // Reaching here means the panic was isolated; confirm the driver still processes the next event.
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Data(1, vec![0u8, 1, 2, 3]),
-        );
+        apply_event(&mut node, &mut writers, Ev::Data(1, vec![0u8, 1, 2, 3]));
     }
 
     #[test]
@@ -3999,7 +4933,6 @@ mod driver_tests {
         // malformed ingest is a silent no-op (never a panic).
         let mut node = test_node();
         let mut writers = HashMap::new();
-        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
         let recipient = Identity::generate();
         let spk = recipient.derive_prekey();
         let bytes = {
@@ -4019,18 +4952,13 @@ mod driver_tests {
             .unwrap()
         };
         assert!(node.queue().is_empty(), "a fresh node holds nothing");
-        apply_event(&mut node, &mut writers, &mut peer_rates, Ev::Ingest(bytes));
+        apply_event(&mut node, &mut writers, Ev::Ingest(bytes));
         assert!(
             !node.queue().is_empty(),
             "an ingested undeliverable bundle is held for forwarding"
         );
         let held = node.queue().len();
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Ingest(vec![0xFF; 8]),
-        );
+        apply_event(&mut node, &mut writers, Ev::Ingest(vec![0xFF; 8]));
         assert_eq!(
             node.queue().len(),
             held,
@@ -4056,12 +4984,7 @@ mod driver_tests {
             .to_bytes()
             .unwrap()
         };
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Ingest(device_bundle),
-        );
+        apply_event(&mut node, &mut writers, Ev::Ingest(device_bundle));
 
         // And the Vaccine dst arm (a relay-vaccine bundle, §39): its ingest log line takes the
         // "vaccine" branch of the destination match.
@@ -4071,25 +4994,18 @@ mod driver_tests {
                 .to_bytes()
                 .unwrap()
         };
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::Ingest(vaccine_bundle),
-        );
+        apply_event(&mut node, &mut writers, Ev::Ingest(vaccine_bundle));
     }
 
     #[test]
     fn custody_ingest_acks_only_after_parse_accept_and_flush() {
         let mut node = test_node();
         let mut writers = HashMap::new();
-        let mut peer_rates = HashMap::new();
 
         let (bad_tx, bad_rx) = mpsc::sync_channel(1);
         apply_event(
             &mut node,
             &mut writers,
-            &mut peer_rates,
             Ev::IngestCustody(vec![0xFF; 8], bad_tx),
         );
         assert_eq!(bad_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
@@ -4110,12 +5026,7 @@ mod driver_tests {
         .to_bytes()
         .unwrap();
         let (ok_tx, ok_rx) = mpsc::sync_channel(1);
-        apply_event(
-            &mut node,
-            &mut writers,
-            &mut peer_rates,
-            Ev::IngestCustody(bytes, ok_tx),
-        );
+        apply_event(&mut node, &mut writers, Ev::IngestCustody(bytes, ok_tx));
         assert_eq!(ok_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
         assert!(!node.queue().is_empty());
     }
@@ -4126,9 +5037,9 @@ mod driver_tests {
         // to that link's writer channel. A writer whose receiver has been dropped (its thread is gone)
         // must be evicted from the table when the send fails.
         let mut node = test_node();
-        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
 
-        let (live_tx, live_rx) = mpsc::channel::<Vec<u8>>();
+        let (live_tx, live_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
         node.handle(BearerEvent::Connected(1, Role::Initiator));
         node.tick(now_ms());
         writers.insert(1u64, live_tx);
@@ -4139,7 +5050,7 @@ mod driver_tests {
         );
         assert!(writers.contains_key(&1), "a live writer is retained");
 
-        let (dead_tx, dead_rx) = mpsc::channel::<Vec<u8>>();
+        let (dead_tx, dead_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_OUTBOUND_FRAMES_PER_LINK);
         drop(dead_rx); // the writer thread is gone: sends will fail
         node.handle(BearerEvent::Connected(2, Role::Initiator));
         node.tick(now_ms());
@@ -4236,24 +5147,34 @@ mod driver_tests {
 
         for i in 0..MAX_PEER_MSGS_PER_WINDOW {
             assert!(
-                peer_data_allowed(&mut rates, hostile, start + i as u64),
+                peer_data_allowed(&mut rates, hostile, start + i as u64, 1),
                 "message {i} is within budget"
             );
         }
         assert!(
-            !peer_data_allowed(&mut rates, hostile, start + MAX_PEER_MSGS_PER_WINDOW as u64),
+            !peer_data_allowed(
+                &mut rates,
+                hostile,
+                start + MAX_PEER_MSGS_PER_WINDOW as u64,
+                1,
+            ),
             "the message past the window budget is shed"
         );
 
         // Fairness: a different peer's key has its own untouched budget in the same window.
         assert!(
-            peer_data_allowed(&mut rates, victim, start + MAX_PEER_MSGS_PER_WINDOW as u64),
+            peer_data_allowed(
+                &mut rates,
+                victim,
+                start + MAX_PEER_MSGS_PER_WINDOW as u64,
+                1,
+            ),
             "a second peer is not shed by the first peer's exhausted budget"
         );
 
         // The window resets after PEER_RATE_WINDOW_MS: the hostile key is admitted again.
         assert!(
-            peer_data_allowed(&mut rates, hostile, start + PEER_RATE_WINDOW_MS),
+            peer_data_allowed(&mut rates, hostile, start + PEER_RATE_WINDOW_MS, 1),
             "a new fixed window resets the budget"
         );
     }
@@ -4268,7 +5189,7 @@ mod driver_tests {
         let now = 5_000_000u64;
         for i in 0..MAX_PREAUTH_MSGS_PER_WINDOW {
             assert!(
-                peer_data_allowed(&mut rates, PeerRateKey::PreAuth, now + i as u64),
+                peer_data_allowed(&mut rates, PeerRateKey::PreAuth, now + i as u64, 1),
                 "pre-auth message {i} is within the shared budget"
             );
         }
@@ -4278,7 +5199,8 @@ mod driver_tests {
             !peer_data_allowed(
                 &mut rates,
                 PeerRateKey::PreAuth,
-                now + MAX_PREAUTH_MSGS_PER_WINDOW as u64
+                now + MAX_PREAUTH_MSGS_PER_WINDOW as u64,
+                1,
             ),
             "F-18b: a reconnect cannot dodge the shared pre-auth cap"
         );
@@ -4300,7 +5222,7 @@ mod driver_tests {
         for i in 0..(MAX_PEER_RATE_KEYS as u64 + 5_000) {
             let mut addr = [0u8; 32];
             addr[..8].copy_from_slice(&i.to_le_bytes());
-            peer_data_allowed(&mut rates, PeerRateKey::Peer(addr), now);
+            peer_data_allowed(&mut rates, PeerRateKey::Peer(addr), now, 1);
         }
         assert!(
             rates.len() <= MAX_PEER_RATE_KEYS,
@@ -4311,7 +5233,7 @@ mod driver_tests {
     }
 
     #[test]
-    fn peer_rate_key_follows_the_authenticated_address_not_the_link_id() {
+    fn producer_admission_follows_the_authenticated_address_not_the_link_id() {
         // Before any handshake, an unknown link id has no peer yet: F-7 falls back to the shared PreAuth
         // bucket (F-18b: NOT a per-link key, so reconnect churn can't multiply the pre-auth budget).
         // Once the XX handshake completes, Node::peer_links reports the address, and the key switches to
@@ -4319,21 +5241,142 @@ mod driver_tests {
         // point of not keying on IP behind the LB.
         let mut a = test_node();
         let mut b = test_node();
+        let (tx, _rx) = event_channel();
         assert_eq!(
-            peer_rate_key(&a, 42),
-            PeerRateKey::PreAuth,
+            tx.data_permit(42, 1),
+            Some(PeerRateKey::PreAuth),
             "an unknown/unauthenticated link shares the PreAuth bucket"
         );
         handshake(&mut a, 1, Role::Initiator, &mut b, 2, Role::Responder);
+        tx.bind_peers(&a.peer_links());
         assert_eq!(
-            peer_rate_key(&a, 1),
-            PeerRateKey::Peer(b.address()),
+            tx.data_permit(1, 1),
+            Some(PeerRateKey::Peer(b.address())),
             "once authenticated, the key follows the peer's address, not the link id"
         );
+        tx.bind_peers(&b.peer_links());
         assert_eq!(
-            peer_rate_key(&b, 2),
-            PeerRateKey::Peer(a.address()),
+            tx.data_permit(2, 1),
+            Some(PeerRateKey::Peer(a.address())),
             "symmetric on the other side of the same link"
+        );
+    }
+
+    #[test]
+    fn saturated_event_queue_still_ticks_prunes_and_retransmits() {
+        let clock = now_ms();
+        let created_at = clock.saturating_sub(10_000);
+        let identity = Identity::generate();
+        let destination = Identity::generate();
+        let pending = Bundle::create(
+            &identity,
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"retry".to_vec(),
+            },
+            BundleOpts {
+                created_at,
+                lifetime_ms: 60_000,
+                flags: BundleFlags {
+                    request_ack: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pending_id = pending.id();
+        let mut store = MemoryStore::new();
+        assert!(store.put(pending, created_at));
+        let mut node = Node::with_store(identity, store);
+        node.set_time(created_at);
+        node.set_observe(true);
+
+        let mut peer = test_node();
+        peer.set_time(created_at);
+        handshake(&mut node, 1, Role::Initiator, &mut peer, 1, Role::Responder);
+        node.drain_outgoing();
+        node.drain_transfers();
+
+        let expiring = Bundle::create(
+            &Identity::generate(),
+            Destination::Device(destination.address()),
+            &destination.address(),
+            &Payload::PeerMessage {
+                content_type: "text/plain".into(),
+                body: b"expire".to_vec(),
+            },
+            BundleOpts {
+                created_at,
+                lifetime_ms: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expiring_id = expiring.id();
+        assert!(node.store.put(expiring, created_at));
+
+        let (event_tx, event_rx) = event_channel();
+        let peers: Vec<_> = (0..=MAX_EVENT_QUEUE_EVENTS / MAX_EVENT_SOURCE_EVENTS)
+            .map(|n| ([n as u8; 32], 1_000 + n as u64))
+            .collect();
+        event_tx.bind_peers(&peers);
+        for (peer_index, (_, link)) in peers.iter().take(16).enumerate() {
+            for _ in 0..MAX_EVENT_SOURCE_EVENTS {
+                event_tx
+                    .try_send_data(*link, vec![peer_index as u8])
+                    .unwrap();
+            }
+            if peer_index == 0 {
+                assert_eq!(
+                    event_tx.try_send_data(*link, vec![0]),
+                    Err(QueueAdmissionError::SourceFull)
+                );
+            }
+        }
+        assert_eq!(
+            event_tx.try_send_data(peers[16].1, vec![16]),
+            Err(QueueAdmissionError::QueueFull)
+        );
+        assert_eq!(
+            event_tx.usage(),
+            (MAX_EVENT_QUEUE_EVENTS, MAX_EVENT_QUEUE_EVENTS)
+        );
+
+        let mut writers = HashMap::new();
+        let (writer, _writer_rx) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        writers.insert(1, writer);
+        let mut prev_peers = std::collections::HashSet::new();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: clock,
+            next_tick: Instant::now(),
+            next_durability_probe: Instant::now() + DURABILITY_PROBE_INTERVAL,
+        };
+        assert!(driver_step(
+            &mut node,
+            &mut writers,
+            &event_tx,
+            &event_rx,
+            &mut prev_peers,
+            &mut schedule,
+        ));
+
+        assert!(
+            !node.store.contains(&expiring_id),
+            "tick pruned expired custody"
+        );
+        assert!(
+            node.drain_transfers()
+                .iter()
+                .any(|(_, id, _)| *id == pending_id),
+            "the pending bundle retransmitted while the event queue stayed nonempty"
+        );
+        assert_eq!(
+            event_tx.usage().0,
+            MAX_EVENT_QUEUE_EVENTS - MAX_EVENT_BATCH,
+            "one step processes only a bounded batch"
         );
     }
 
@@ -4351,8 +5394,8 @@ mod driver_tests {
         let mut d = test_node();
         let mut hostile = test_node();
         let mut victim = test_node();
-        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
-        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
+        let (event_tx, event_rx) = event_channel();
 
         const LINK_HOSTILE: u64 = 101;
         const LINK_VICTIM: u64 = 102;
@@ -4380,6 +5423,7 @@ mod driver_tests {
             d.peer_links().contains(&(victim.address(), LINK_VICTIM)),
             "d and victim completed the handshake"
         );
+        event_tx.bind_peers(&d.peer_links());
 
         // Publish + gossip d's prekey to both peers so send_to can open a forward-secret session to d
         // (DESIGN.md §25: content is never static-sealed, so a real send needs this first).
@@ -4411,11 +5455,11 @@ mod driver_tests {
         );
         for (l, bytes) in outgoing {
             if l == 1 {
+                event_tx.try_send_data(LINK_HOSTILE, bytes).unwrap();
                 apply_event(
                     &mut d,
                     &mut writers,
-                    &mut peer_rates,
-                    Ev::Data(LINK_HOSTILE, bytes),
+                    event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
                 );
             }
         }
@@ -4427,11 +5471,12 @@ mod driver_tests {
 
         // Simulate hostile having already spent its whole window's budget: equivalent to having
         // already sent MAX_PEER_MSGS_PER_WINDOW frames this window, without looping that many times.
-        peer_rates.insert(
+        event_tx.ingress.lock().unwrap().rates.insert(
             PeerRateKey::Peer(hostile.address()),
             PeerRateWindow {
                 start_ms: now_ms(),
                 msgs: MAX_PEER_MSGS_PER_WINDOW,
+                bytes: 0,
             },
         );
 
@@ -4448,11 +5493,9 @@ mod driver_tests {
         assert!(sent2.is_some());
         for (l, bytes) in hostile.drain_outgoing() {
             if l == 1 {
-                apply_event(
-                    &mut d,
-                    &mut writers,
-                    &mut peer_rates,
-                    Ev::Data(LINK_HOSTILE, bytes),
+                assert!(
+                    event_tx.try_send_data(LINK_HOSTILE, bytes).is_err(),
+                    "the hostile frame is rejected before enqueue"
                 );
             }
         }
@@ -4474,11 +5517,11 @@ mod driver_tests {
         assert!(sent3.is_some());
         for (l, bytes) in victim.drain_outgoing() {
             if l == 1 {
+                event_tx.try_send_data(LINK_VICTIM, bytes).unwrap();
                 apply_event(
                     &mut d,
                     &mut writers,
-                    &mut peer_rates,
-                    Ev::Data(LINK_VICTIM, bytes),
+                    event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
                 );
             }
         }
@@ -4495,7 +5538,6 @@ mod ws_and_tcp_driver_tests {
     use super::*;
     use std::io::ErrorKind;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
     use tungstenite::Message;
 
     #[test]
@@ -4505,7 +5547,7 @@ mod ws_and_tcp_driver_tests {
         // frame, and report Ev::Down on close. Drive it end to end with a real tungstenite client.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             sock.set_nodelay(true).ok();
@@ -4589,7 +5631,7 @@ mod ws_and_tcp_driver_tests {
         // Disconnected and breaks the connection, reporting the link down.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             sock.set_nodelay(true).ok();
@@ -4633,7 +5675,7 @@ mod ws_and_tcp_driver_tests {
         // relies on). Grab the out Sender from Ev::Up, push bytes, and read the framed bytes back.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let (ev_tx, ev_rx) = event_channel();
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
             serve_tcp(sock, Role::Responder, &ev_tx);
@@ -4693,7 +5735,7 @@ mod build_store_tests {
         let db = tmp_db("plain");
         let _ = std::fs::remove_file(&db);
         let addr = Identity::generate().address();
-        let store = build_store(&None, &db, &addr);
+        let store = build_store(&None, &db, &addr).unwrap();
         let _node = Node::with_store(Identity::generate(), store);
         assert!(
             std::fs::metadata(&db).is_ok(),
@@ -4704,16 +5746,17 @@ mod build_store_tests {
 
     #[cfg(not(feature = "firestore"))]
     #[test]
-    fn build_store_falls_back_to_sqlite_when_firestore_is_not_compiled_in() {
-        // Without the firestore feature, even passing --firestore PROJECT must NOT fail: it warns and
-        // uses local SQLite, so a mis-flagged plain VM build still comes up with a working store.
+    fn configured_firestore_fails_closed_when_support_is_not_compiled_in() {
         let db = tmp_db("fallback");
         let _ = std::fs::remove_file(&db);
         let addr = Identity::generate().address();
-        let _store = build_store(&Some("some-gcp-project".to_string()), &db, &addr);
+        let error = build_store(&Some("some-gcp-project".to_string()), &db, &addr)
+            .err()
+            .expect("configured Firestore must fail closed");
+        assert!(error.contains("not compiled"));
         assert!(
-            std::fs::metadata(&db).is_ok(),
-            "fell back to a local sqlite db"
+            std::fs::metadata(&db).is_err(),
+            "no ephemeral/local fallback database is opened"
         );
         let _ = std::fs::remove_file(&db);
     }
@@ -4748,25 +5791,21 @@ mod shutdown_tests {
         // channel also returns false. Serialize on the shared lock: it writes LAST_TICK_MS/SHUTDOWN.
         let _lock = lock_driver_statics();
         let mut node = Node::with_store(Identity::generate(), MemoryStore::new());
-        let mut writers: HashMap<u64, Sender<Vec<u8>>> = HashMap::new();
-        let mut peer_rates: HashMap<PeerRateKey, PeerRateWindow> = HashMap::new();
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
         let mut prev = std::collections::HashSet::new();
-        let mut last_stats = 0u64;
-        let (tx, rx) = mpsc::channel::<Ev>();
+        let (tx, rx) = event_channel();
+        let mut schedule = DriverSchedule {
+            last_stats_ms: 0,
+            next_tick: Instant::now(),
+            next_durability_probe: Instant::now() + DURABILITY_PROBE_INTERVAL,
+        };
 
         SHUTDOWN.store(false, Ordering::SeqCst);
         LAST_TICK_MS.store(0, Ordering::Relaxed);
-        let (out_tx, _out_rx) = mpsc::channel();
+        let (out_tx, _out_rx) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
         tx.send(Ev::Up(9, Role::Responder, out_tx)).unwrap();
         assert!(
-            driver_step(
-                &mut node,
-                &mut writers,
-                &mut peer_rates,
-                &rx,
-                &mut prev,
-                &mut last_stats
-            ),
+            driver_step(&mut node, &mut writers, &tx, &rx, &mut prev, &mut schedule,),
             "a queued event => continue"
         );
         assert!(
@@ -4781,43 +5820,33 @@ mod shutdown_tests {
 
         // An idle iteration (channel open, nothing queued): recv_timeout elapses (~1s) and the node
         // ticks, still returning true. This is the steady-state path of the loop.
+        schedule.next_tick = Instant::now();
         assert!(
-            driver_step(
-                &mut node,
-                &mut writers,
-                &mut peer_rates,
-                &rx,
-                &mut prev,
-                &mut last_stats
-            ),
+            driver_step(&mut node, &mut writers, &tx, &rx, &mut prev, &mut schedule,),
             "an idle iteration ticks the node and continues"
         );
 
         // SIGTERM: driver_step drains the durable store and signals exit.
         SHUTDOWN.store(true, Ordering::SeqCst);
         assert!(
-            !driver_step(
-                &mut node,
-                &mut writers,
-                &mut peer_rates,
-                &rx,
-                &mut prev,
-                &mut last_stats
-            ),
+            !driver_step(&mut node, &mut writers, &tx, &rx, &mut prev, &mut schedule,),
             "SHUTDOWN set => drain and exit"
         );
         SHUTDOWN.store(false, Ordering::SeqCst);
 
         // A closed event channel (all senders dropped) also ends the loop.
         drop(tx);
+        let (closed_tx, closed_rx) = event_channel();
+        drop(closed_tx);
+        let (control_tx, _control_rx) = event_channel();
         assert!(
             !driver_step(
                 &mut node,
                 &mut writers,
-                &mut peer_rates,
-                &rx,
+                &control_tx,
+                &closed_rx,
                 &mut prev,
-                &mut last_stats
+                &mut schedule,
             ),
             "a disconnected channel => exit"
         );
