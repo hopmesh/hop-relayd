@@ -90,6 +90,25 @@ fn frame_len_ok(n: usize) -> bool {
 const MAX_CONNS: usize = 1_024;
 static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// services-r18-04 (ADV18-04/05): an idle-read deadline for a connection that holds one of the
+/// [`MAX_CONNS`] slots. Both the raw-TCP bearer and the post-classification WebSocket handshake read
+/// from a client that has already been charged a durable slot; without a deadline a client that sends
+/// nothing (or dribbles a partial frame / upgrade) pins that slot and its thread forever (slowloris).
+/// Bounds how long a silent holder can occupy a slot: an honest peer sends or heartbeats well inside
+/// it, a slowloris is reaped. Long enough not to disturb a legitimately quiet-but-live mesh link.
+const CONN_IDLE_READ_TIMEOUT_MS: u64 = 30_000;
+
+/// The effective idle-read deadline. Normally [`CONN_IDLE_READ_TIMEOUT_MS`]; a test seam
+/// (`HOP_CONN_IDLE_READ_TIMEOUT_MS`) lets a slowloris test drive a short deadline and observe the
+/// connection reaped without waiting the full window.
+fn conn_idle_read_timeout() -> Duration {
+    let ms = std::env::var("HOP_CONN_IDLE_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CONN_IDLE_READ_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
 /// services-r3-01: a separate, deliberately small budget for public live-log viewers. These are
 /// idle, unauthenticated observers; they must not be able to exhaust the mesh budget. Even fully
 /// saturated, log viewers leave all [`MAX_CONNS`] mesh slots free. Combined with the per-viewer
@@ -1758,6 +1777,11 @@ const HANDOFF_INTERVAL_MS: u64 = 20_000;
 fn serve_tcp(stream: TcpStream, role: Role, ev_tx: &EventTx) {
     let link = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
     let _ = stream.set_nodelay(true);
+    // services-r18-04 (ADV18-04): bound the blocking read below. Without this a client that connects
+    // and sends nothing (or 3 of 4 length bytes) holds a MAX_CONNS slot and its thread forever. On an
+    // idle timeout `read_exact` errors and the loop breaks, releasing the slot. A live peer resets the
+    // clock on every frame, so a legitimately quiet link only closes after a full idle window.
+    let _ = stream.set_read_timeout(Some(conn_idle_read_timeout()));
     let mut write_half = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -1847,9 +1871,14 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
         }
         _ => WsKind::Empty, // no data / probe with no payload — nothing to serve
     };
-    // Restore the blocking socket the handlers expect (tungstenite reads without a read timeout).
+    // services-r18-05 (ADV18-05): an Upgrade is about to be charged a durable mesh slot and then run
+    // through tungstenite's `accept_with_config`, which reads the rest of the HTTP upgrade. Do NOT
+    // hand it a blocking, deadline-less socket: a client that passes this peek with an
+    // `Upgrade: websocket` header and then dribbles the rest of the handshake would pin a mesh slot
+    // for the whole handshake. Keep a bounded idle read timeout across the handshake; the steady-state
+    // WS loop resets its own short read timeout (100ms) right after `accept_with_config` succeeds.
     if kind == WsKind::Upgrade {
-        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_read_timeout(Some(conn_idle_read_timeout()));
     }
     kind
 }
@@ -5711,6 +5740,47 @@ mod ws_and_tcp_driver_tests {
         let _ = out.send(b"after-close".to_vec());
         std::thread::sleep(Duration::from_millis(20));
         drop(out); // end the writer thread's recv so serve_tcp returns
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn serve_tcp_reaps_a_silent_slowloris_client() {
+        // ADV18-04: a raw-TCP client that connects and then sends NOTHING must not pin its MAX_CONNS
+        // slot and thread forever. With the idle read timeout the blocking read_exact errors out and
+        // serve_tcp returns Ev::Down, releasing the slot. Drive a short deadline via the test seam and
+        // assert the connection is reaped without the client ever sending a byte.
+        std::env::set_var("HOP_CONN_IDLE_READ_TIMEOUT_MS", "200");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ev_tx, ev_rx) = event_channel();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_tcp(sock, Role::Responder, &ev_tx);
+        });
+
+        // Connect and stay completely silent (the slowloris): never write a length prefix.
+        let _silent = TcpStream::connect(addr).unwrap();
+        // The link comes up (Ev::Up), then the idle read timeout must fire and end it (Ev::Down),
+        // well inside the generous bound, proving a silent holder cannot camp the slot.
+        let mut saw_up = false;
+        let mut saw_down = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            match ev_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ev::Up(..)) => saw_up = true,
+                Ok(Ev::Down(_)) => {
+                    saw_down = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        std::env::remove_var("HOP_CONN_IDLE_READ_TIMEOUT_MS");
+        assert!(saw_up, "the silent client's link came up");
+        assert!(
+            saw_down,
+            "a silent slowloris must be reaped by the idle read timeout, not pin the slot forever"
+        );
         server.join().unwrap();
     }
 }
