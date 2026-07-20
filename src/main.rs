@@ -757,6 +757,7 @@ fn access_policy_from(
     tenant_keys: &[(TenantId, PubKeyBytes)],
     deny_tenants: &[TenantId],
     stamp_flag_error: bool,
+    allow_empty: bool,
 ) -> std::result::Result<Option<AccessPolicy>, String> {
     if !require_stamps {
         return Ok(None);
@@ -766,7 +767,11 @@ fn access_policy_from(
     if stamp_flag_error {
         return Err("--require-stamps with a malformed --tenant-key/--deny-tenant".to_string());
     }
-    if tenant_keys.is_empty() {
+    // An empty key set is a config typo when the ONLY source is static flags (`allow_empty=false`),
+    // but a legitimate state when the tenant registry is the source (`allow_empty=true`): a fresh
+    // registry has no tenants yet, and booting keyed-but-empty simply refuses all metered traffic
+    // until one syncs, which is closed, not open.
+    if tenant_keys.is_empty() && !allow_empty {
         return Err("--require-stamps needs at least one valid --tenant-key".to_string());
     }
     let mut server = KeyServer::new();
@@ -775,6 +780,24 @@ fn access_policy_from(
     }
     let denied = deny_tenants.iter().copied().collect();
     Ok(Some(AccessPolicy::Keyed(KeyedAccess::new(server, denied))))
+}
+
+/// Load the tenant carriage keys from the Firestore tenant registry (the account service's
+/// projection). Only ACTIVE tenants with an issued carriage key contribute; an inactive tenant or one
+/// without a key is omitted (and so cannot stamp = refused on a keyed relay). A read ERROR is returned
+/// (never swallowed): the caller fails closed and exits rather than booting a keyed relay that would
+/// silently refuse every paying tenant whose key lives only in the registry.
+#[cfg(feature = "firestore")]
+fn load_registry_tenant_keys(
+    project: &str,
+) -> std::result::Result<Vec<(TenantId, PubKeyBytes)>, String> {
+    let registry = hop_store_firestore::TenantRegistry::new(project);
+    let records = registry
+        .all()
+        .map_err(|e| format!("tenant registry read: {e}"))?;
+    // TenantRecord::carriage_key admits only active, keyed, well-formed rows (a malformed row must
+    // not authorize anything); the active/keyed/hex rule lives once in hop-store-firestore.
+    Ok(records.iter().filter_map(|r| r.carriage_key()).collect())
 }
 
 /// How often the driver drains the node's in-memory §35 usage into the durable ledger. A crash
@@ -1584,12 +1607,38 @@ fn main() {
     // checked at now_ms=0, where every cert reads unexpired (0 >= exp is false), so an
     // already-expired tenant cert would be admitted + metered. Seeding closes that startup gap.
     node.set_time(now_ms());
-    // §35 keyed-relay admission, config-gated (default: open, exactly the pre-stamp behavior).
+    // §35 keyed-relay admission, config-gated (default: open, exactly the pre-stamp behavior). Tenant
+    // keys come from the static --tenant-key flags PLUS, when --firestore is set, the tenant registry
+    // the account service projects (the live source). The registry is loaded last so a synced key
+    // wins over a stale bootstrap flag. A registry READ ERROR fails closed (exit), never a boot that
+    // silently refuses paying tenants.
+    #[cfg_attr(not(feature = "firestore"), allow(unused_mut))]
+    let mut effective_tenant_keys = tenant_keys.clone();
+    // `allow_empty` only relaxes the "need a key" check when the registry is genuinely the source: the
+    // firestore feature is built AND --firestore is set. A static-only build keeps the strict check.
+    #[cfg(feature = "firestore")]
+    let registry_backed = firestore.is_some() && require_stamps;
+    #[cfg(not(feature = "firestore"))]
+    let registry_backed = false;
+    #[cfg(feature = "firestore")]
+    if let (true, Some(project)) = (require_stamps, firestore.as_deref()) {
+        match load_registry_tenant_keys(project) {
+            Ok(keys) => {
+                println!("hop-relayd: tenant registry: {} key(s) loaded", keys.len());
+                effective_tenant_keys.extend(keys);
+            }
+            Err(e) => {
+                eprintln!("hop-relayd: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     match access_policy_from(
         require_stamps,
-        &tenant_keys,
+        &effective_tenant_keys,
         &deny_tenants,
         stamp_flag_error,
+        registry_backed,
     ) {
         Err(e) => {
             eprintln!("hop-relayd: {e}");
@@ -1598,7 +1647,7 @@ fn main() {
         Ok(Some(policy)) => {
             println!(
                 "hop-relayd: keyed relay: {} tenant key(s), {} denied tenant(s)",
-                tenant_keys.len(),
+                effective_tenant_keys.len(),
                 deny_tenants.len()
             );
             node.set_access_policy(policy);
@@ -6091,25 +6140,31 @@ mod access_and_ledger_tests {
         let pair = ([9u8; 16], Identity::generate().address());
         // Default: open.
         assert!(matches!(
-            access_policy_from(false, &[], &[], false),
+            access_policy_from(false, &[], &[], false, false),
             Ok(None)
         ));
         // Keyed with a tenant key: a Keyed policy.
         assert!(matches!(
-            access_policy_from(true, &[pair], &[[9u8; 16]], false),
+            access_policy_from(true, &[pair], &[[9u8; 16]], false, false),
             Ok(Some(AccessPolicy::Keyed(_)))
         ));
-        // require-stamps with zero tenant keys: refused, never silently open.
-        assert!(access_policy_from(true, &[], &[], false).is_err());
-        // require-stamps with a malformed key flag: refused.
-        assert!(access_policy_from(true, &[pair], &[], true).is_err());
+        // require-stamps with zero tenant keys AND static-only source: refused, never silently open.
+        assert!(access_policy_from(true, &[], &[], false, false).is_err());
+        // ...but zero keys from an EMPTY tenant registry (allow_empty) boots keyed-but-empty: a fresh
+        // registry with no tenants refuses all metered traffic, which is closed, not open.
+        assert!(matches!(
+            access_policy_from(true, &[], &[], false, true),
+            Ok(Some(AccessPolicy::Keyed(_)))
+        ));
+        // require-stamps with a malformed key flag: refused even when allow_empty.
+        assert!(access_policy_from(true, &[pair], &[], true, true).is_err());
     }
 
     #[test]
     fn the_policy_wires_through_to_the_node() {
         let mut node = Node::new(Identity::generate());
         let pair = ([1u8; 16], Identity::generate().address());
-        let policy = access_policy_from(true, &[pair], &[], false)
+        let policy = access_policy_from(true, &[pair], &[], false, false)
             .unwrap()
             .unwrap();
         node.set_access_policy(policy);
