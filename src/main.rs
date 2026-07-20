@@ -807,6 +807,10 @@ const USAGE_FLUSH_MS: u64 = 30_000;
 /// Last ledger flush (driver-thread only; a static so `driver_step`'s signature stays put).
 static LAST_USAGE_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Last storage-occupancy sample time (driver-thread only). Zero until the first flush, so the
+/// first sample only SEEDS the clock and accrues nothing (there is no prior interval to integrate).
+static LAST_STORAGE_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+
 /// One ledger row key: per (hour bucket, tenant).
 fn usage_kv_key(hour: u64, tenant: &TenantId) -> String {
     format!("usage/{hour}/{}", hex_string(tenant))
@@ -852,6 +856,47 @@ fn merge_usage_into_store<S: Store>(
     drained.len()
 }
 
+/// One storage-occupancy row key: per (hour bucket, tenant). A SEPARATE prefix from `usage/` on
+/// purpose (§35 header rule: only ever ADD fields by a new key prefix, never re-shape the 16-byte
+/// carriage value in place). Mirrors the `telemetry_usage/` precedent; a reader that predates it
+/// simply ignores the unknown prefix.
+fn storage_usage_kv_key(hour: u64, tenant: &TenantId) -> String {
+    format!("storage_usage/{hour}/{}", hex_string(tenant))
+}
+
+/// Storage row value: accrued occupancy in byte-milliseconds, u64 LE (8 bytes). Anything malformed
+/// reads as zero (the row is overwritten whole, so a corrupt value can never wedge the flush loop).
+fn encode_storage(byte_ms: u64) -> Vec<u8> {
+    byte_ms.to_le_bytes().to_vec()
+}
+
+fn decode_storage(bytes: &[u8]) -> u64 {
+    <[u8; 8]>::try_from(bytes)
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
+}
+
+/// RMW the accrued per-tenant byte-milliseconds into the hour-bucketed storage rows. Only this node
+/// writes its own kv, so the RMW is race-free. Zero-accrual tenants are skipped. Returns rows touched.
+fn merge_storage_into_store<S: Store>(
+    store: &mut S,
+    accrued: &[(TenantId, u64)],
+    now_ms: u64,
+) -> usize {
+    let hour = now_ms / 3_600_000;
+    let mut rows = 0;
+    for (tenant, byte_ms) in accrued {
+        if *byte_ms == 0 {
+            continue;
+        }
+        let key = storage_usage_kv_key(hour, tenant);
+        let prev = store.get_kv(&key).map(|b| decode_storage(&b)).unwrap_or(0);
+        store.put_kv(&key, encode_storage(prev.saturating_add(*byte_ms)));
+        rows += 1;
+    }
+    rows
+}
+
 /// Drain the node's §35 meter + refusal counter into the ledger and the private log, now.
 fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
     let refused = node.take_access_refused();
@@ -868,6 +913,23 @@ fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
             "usage: {dropped} accepted bundle(s) UNMETERED (tenant-map overflow) — shorten the flush interval"
         ));
     }
+
+    // §35 storage floor: integrate current occupancy (held sealed bytes per tenant) over the
+    // interval since the last sample into `storage_usage/` rows. This runs REGARDLESS of carriage
+    // activity, since a relay that is merely HOLDING bundles accrues storage even in an interval
+    // with no deliveries, so it precedes the carriage early-return below. The first sample only
+    // seeds the clock (swap returns 0), so no bogus now-since-epoch interval is ever accrued.
+    let last_sample = LAST_STORAGE_SAMPLE_MS.swap(now, Ordering::Relaxed);
+    let dt = now.saturating_sub(last_sample);
+    if last_sample != 0 && dt > 0 {
+        let accrued: Vec<(TenantId, u64)> = node
+            .sample_storage_bytes()
+            .into_iter()
+            .map(|(t, bytes)| (t, bytes.saturating_mul(dt)))
+            .collect();
+        merge_storage_into_store(&mut node.store, &accrued, now);
+    }
+
     let drained = node.take_usage();
     if drained.is_empty() {
         return;
@@ -6256,5 +6318,47 @@ mod access_and_ledger_tests {
         );
         // And the ledger prefix lists exactly the three rows.
         assert_eq!(store.list_kv("usage/").len(), 3);
+    }
+
+    #[test]
+    fn storage_rows_roundtrip_and_malformed_values_read_as_zero() {
+        assert_eq!(decode_storage(&encode_storage(1 << 50)), 1 << 50);
+        assert_eq!(decode_storage(b"garbage"), 0);
+        assert_eq!(decode_storage(&[]), 0);
+        // 8 bytes exactly; distinct prefix from the 16-byte carriage row so the two never collide.
+        assert_eq!(encode_storage(1).len(), 8);
+        assert!(storage_usage_kv_key(10, &[1u8; 16]).starts_with("storage_usage/"));
+    }
+
+    #[test]
+    fn storage_occupancy_accumulates_within_an_hour_and_splits_across_hours() {
+        let mut store = MemoryStore::new();
+        let t1: TenantId = [1u8; 16];
+        let t2: TenantId = [2u8; 16];
+        let hour0 = 10 * 3_600_000;
+        // Two accruals in the same hour sum into one row per tenant; a zero-accrual tenant is skipped.
+        merge_storage_into_store(&mut store, &[(t1, 300), (t2, 0)], hour0);
+        merge_storage_into_store(&mut store, &[(t1, 200)], hour0 + 60_000);
+        assert_eq!(
+            decode_storage(&store.get_kv(&storage_usage_kv_key(10, &t1)).unwrap()),
+            500
+        );
+        assert!(
+            store.get_kv(&storage_usage_kv_key(10, &t2)).is_none(),
+            "a zero-accrual tenant writes no row"
+        );
+        // The next hour opens a fresh row; the old one is untouched.
+        merge_storage_into_store(&mut store, &[(t1, 700)], 11 * 3_600_000);
+        assert_eq!(
+            decode_storage(&store.get_kv(&storage_usage_kv_key(11, &t1)).unwrap()),
+            700
+        );
+        assert_eq!(
+            decode_storage(&store.get_kv(&storage_usage_kv_key(10, &t1)).unwrap()),
+            500
+        );
+        // Storage rows are under their own prefix, never mixed with carriage rows.
+        assert_eq!(store.list_kv("storage_usage/").len(), 2);
+        assert_eq!(store.list_kv("usage/").len(), 0);
     }
 }
