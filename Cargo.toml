@@ -31,7 +31,7 @@ version.workspace = true
 edition.workspace = true
 license-file = "LICENSE.md"
 repository.workspace = true
-description = "Hop cloud relay daemon — an always-on node bridging local meshes over the internet (DESIGN.md §19, §21)."
+description = "Hop cloud relay daemon, an always-on node bridging local meshes over the internet (DESIGN.md §19, §21)."
 
 [[bin]]
 name = "hop-relayd"

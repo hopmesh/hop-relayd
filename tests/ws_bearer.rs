@@ -2,8 +2,8 @@
 //! and an end-to-end message, with each link packet riding one WS binary frame.
 //!
 //! This stands up a genuine localhost WebSocket (server `tungstenite::accept`,
-//! client `tungstenite::client`) and bridges a `Node` on each end — exactly what
-//! `serve_ws` does in the daemon — then sends a message client → server and asserts
+//! client `tungstenite::client`) and bridges a `Node` on each end, exactly what
+//! `serve_ws` does in the daemon, then sends a message client → server and asserts
 //! it arrives decrypted.
 
 use std::io::ErrorKind;
@@ -52,7 +52,7 @@ fn message_round_trips_over_a_real_websocket() {
             .ok();
 
         let mut node = Node::with_store(server_id, MemoryStore::new());
-        // Publish our prekey so it gossips to the client on link-up — content is forward-secret
+        // Publish our prekey so it gossips to the client on link-up, content is forward-secret
         // and defers until the recipient's prekey is known (DESIGN.md §25).
         node.publish_prekey().unwrap();
         node.handle(BearerEvent::Connected(1, Role::Responder));

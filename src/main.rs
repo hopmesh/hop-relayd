@@ -1,21 +1,21 @@
-//! # hop-relayd — the cloud relay daemon
+//! # hop-relayd: the cloud relay daemon
 //!
 //! An always-on Hop node that bridges local meshes over the internet (DESIGN.md
 //! §19, §21): the **device → device → relay → relay → device → device** flow. A
-//! relay is *just a Hop node with a bearer* — it does epidemic store-and-forward
+//! relay is *just a Hop node with a bearer*: it does epidemic store-and-forward
 //! and dedup like any node, and the bundles it carries are sealed end-to-end (§4),
 //! so it relays ciphertext it cannot read.
 //!
 //! Two bearers, same node:
 //!
-//! * `--listen host:port` — raw TCP (path A, the single GCE VM). Each opaque link
+//! * `--listen host:port`, raw TCP (path A, the single GCE VM). Each opaque link
 //!   packet is framed with a 4-byte big-endian length prefix.
-//! * `--ws host:port` — WebSocket (path B, Cloud Run behind the global LB). Each
+//! * `--ws host:port`, WebSocket (path B, Cloud Run behind the global LB). Each
 //!   link packet is exactly one WS binary frame, so WS supplies the framing. The
 //!   load balancer terminates TLS, so the daemon speaks plain `ws://` on `$PORT`.
 //!
 //! In both cases the link's Noise XX handshake (inside the node) authenticates both
-//! ends — the bearer carries opaque bytes and knows nothing about the protocol.
+//! ends, the bearer carries opaque bytes and knows nothing about the protocol.
 //!
 //! Usage:
 //!   hop-relayd [--listen 0.0.0.0:9443] [--ws 0.0.0.0:8080] [--peer host:port]...
@@ -950,7 +950,7 @@ fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
     let dropped = node.take_usage_dropped();
     if dropped > 0 {
         netlog_private(format!(
-            "usage: {dropped} accepted bundle(s) UNMETERED (tenant-map overflow) — shorten the flush interval"
+            "usage: {dropped} accepted bundle(s) UNMETERED (tenant-map overflow): shorten the flush interval"
         ));
     }
 
@@ -1551,7 +1551,7 @@ fn driver_step<S: Store>(
         flush_usage_now(node, now_ms());
         let flushed = node.store.flush(Duration::from_secs(8));
         netlog(format!(
-            "SIGTERM: durable-store flush {} — exiting",
+            "SIGTERM: durable-store flush {}, exiting",
             if flushed { "drained" } else { "timed out" }
         ));
         return false;
@@ -1710,7 +1710,7 @@ fn main() {
     } = parse_args(std::env::args().skip(1));
 
     let base_identity = load_identity(&identity_file, &format!("{db}.key"));
-    // The shared base seed — every region derives its node identity from this same seed, so any
+    // The shared base seed, every region derives its node identity from this same seed, so any
     // node can compute any other region's address (cross-partition handoff, §28).
     let base_seed = base_identity.to_secret_bytes();
     let identity = regional_identity(base_identity, &base_seed, region.as_deref());
@@ -1808,7 +1808,7 @@ fn main() {
         });
     }
 
-    // The set of relay node ids (base58) we've seen in the liveness registry — used to
+    // The set of relay node ids (base58) we've seen in the liveness registry, used to
     // tell a device peer from a peer relay when recording device presence (§28).
     #[cfg(feature = "firestore")]
     let known_relays: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -2025,7 +2025,7 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
     let kind = match stream.peek(&mut head) {
         Ok(n) if n > 0 => {
             let req = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
-            // F-17: a real health probe, tied to the driver loop's heartbeat — distinct from the log
+            // F-17: a real health probe, tied to the driver loop's heartbeat, distinct from the log
             // stream, which stays up even if the driver deadlocks and so is NOT a health signal.
             if req.contains("get /livez") {
                 WsKind::Livez
@@ -2037,7 +2037,7 @@ fn classify_ws_peek(stream: &TcpStream) -> WsKind {
                 WsKind::LogStream
             }
         }
-        _ => WsKind::Empty, // no data / probe with no payload — nothing to serve
+        _ => WsKind::Empty, // no data / probe with no payload, nothing to serve
     };
     // services-r18-05 (ADV18-05): an Upgrade is about to be charged a durable mesh slot and then run
     // through tungstenite's `accept_with_config`, which reads the rest of the HTTP upgrade. Do NOT
@@ -2185,11 +2185,11 @@ fn serve_ws(stream: TcpStream, kind: WsKind, ev_tx: &EventTx) {
 }
 
 /// Dial one **currently-online** peer relay over TLS WebSocket and bridge it to the driver as
-/// an Initiator link — the relay-to-relay epidemic of DESIGN.md §28. Dials **once**: on
+/// an Initiator link, the relay-to-relay epidemic of DESIGN.md §28. Dials **once**: on
 /// disconnect it returns, and the backbone's observe loop re-dials only if the peer is still in
 /// the registry (so a peer that went offline is never re-woken). Mirrors `serve_ws`'s
 /// single-thread read/drain interleave, as a non-blocking client (a TLS read timeout doesn't
-/// reliably surface as WouldBlock; non-blocking does — same fix as the endpoint dialer).
+/// reliably surface as WouldBlock; non-blocking does, same fix as the endpoint dialer).
 #[cfg(feature = "firestore")]
 fn dial_peer(url: &str, ev_tx: &EventTx) {
     use tungstenite::stream::MaybeTlsStream;
@@ -2372,7 +2372,7 @@ fn short_b58(addr: &[u8]) -> String {
     bs58::encode(addr).into_string().chars().take(10).collect()
 }
 
-/// The host of a `wss://`/`ws://` URL — the relay's identify name (DESIGN.md §29).
+/// The host of a `wss://`/`ws://` URL, the relay's identify name (DESIGN.md §29).
 /// `wss://us-central1.relay.hopme.sh/` → `us-central1.relay.hopme.sh`.
 fn host_of(url: &str) -> String {
     let s = url
@@ -2440,10 +2440,10 @@ mod backbone {
             });
         }
 
-        // Observe the registry (a pure read — wakes no one): learn peer-relay ids (so the
+        // Observe the registry (a pure read, wakes no one): learn peer-relay ids (so the
         // handoff records device presence only for actual devices, §28) and, when fanout is
         // enabled, dial up to `fanout` *currently-online* peers we're not already linked to.
-        // We never dial a peer absent from the registry — a sleeping region is never woken.
+        // We never dial a peer absent from the registry, a sleeping region is never woken.
         let dialed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         std::thread::spawn(move || loop {
             match reg.online(now_ms(), TTL_MS) {
@@ -2469,7 +2469,7 @@ mod backbone {
                                 (p.endpoint.clone(), ev_tx.clone(), dialed.clone());
                             std::thread::spawn(move || {
                                 super::dial_peer(&ep, &ev_tx);
-                                dialed.lock().unwrap().remove(&ep); // link closed — re-dial if still online
+                                dialed.lock().unwrap().remove(&ep); // link closed, re-dial if still online
                             });
                         }
                     }
@@ -2889,7 +2889,7 @@ mod mailbox {
 ///
 /// Each region's relay owns a Firestore partition. When a relay holds a device-addressed
 /// bundle it can't deliver locally, it looks up where that device last checked in
-/// (presence) and writes the bundle into *that region's* partition — the destination
+/// (presence) and writes the bundle into *that region's* partition, the destination
 /// region then delivers it on its next device check-in (cold start rehydrates; a warm
 /// node ingests via the reload loop below). Presence is recorded for connected device
 /// peers (a peer relay, identified via the registry, is skipped). All blocking Firestore
@@ -2909,7 +2909,7 @@ mod handoff {
     use super::{now_ms, region_node_b58, DurabilityHandle, Ev, EventTx};
 
     /// A device-presence record is trusted this long after check-in (matches the
-    /// registry TTL — beyond it, we don't know where the device is, so we don't hand off).
+    /// registry TTL; beyond it we don't know where the device is, so we don't hand off).
     const PRESENCE_TTL_MS: u64 = 90_000;
     /// How often a warm node re-reads its own partition for handoffs others wrote.
     const RELOAD_SECS: u64 = 30;
@@ -2920,10 +2920,10 @@ mod handoff {
         pub now_ms: u64,
         pub devices: Vec<PubKeyBytes>,
         pub undeliverable: Vec<(BundleId, PubKeyBytes, Vec<u8>, u64)>,
-        /// §39 P5: private bundles with no live recv-gradient — durably spool each by its
+        /// §39 P5: private bundles with no live recv-gradient. Durably spool each by its
         /// mailbox-tag (a rotatable pseudonym) so an offline recipient can pull it on return.
         pub spool: Vec<(BundleId, Tag, Vec<u8>, u64)>,
-        /// §39 P5: mailbox-tags whose recv-gradient we just (re)laid — the want-beacon. That
+        /// §39 P5: mailbox-tags whose recv-gradient we just (re)laid, the want-beacon. That
         /// recipient is reachable again, so pull anything spooled under each tag and re-ingest.
         pub wanted: Vec<Tag>,
     }
@@ -2988,7 +2988,7 @@ mod handoff {
                         let dst_region =
                             match presence.region_of(&dst_b58, snap.now_ms, PRESENCE_TTL_MS) {
                                 Ok(Some(r)) => r,
-                                Ok(None) => continue, // unknown/stale — nowhere to hand off yet
+                                Ok(None) => continue, // unknown/stale, nowhere to hand off yet
                                 Err(e) => {
                                     durability.mark_not_ready();
                                     eprintln!("handoff: region_of failed: {e}");
@@ -4337,7 +4337,7 @@ mod healthz_tests {
     #[test]
     fn healthz_is_503_before_the_first_tick() {
         // F-17: before the driver has ticked once (LAST_TICK_MS == 0) the instance is not yet live,
-        // so /healthz reports 503 stale — Cloud Run must NOT route traffic to a not-yet-started node.
+        // so /healthz reports 503 stale; Cloud Run must NOT route traffic to a not-yet-started node.
         let _lock = lock_healthz();
         LAST_TICK_MS.store(0, Ordering::Relaxed);
         let resp = drive_healthz();
@@ -4386,7 +4386,7 @@ mod tcp_framing_tests {
 
     /// serve_tcp reads 4-byte big-endian length-prefixed frames off the socket and pushes each
     /// payload to the driver as an Ev::Data. This stands up a real loopback socket, feeds it framed
-    /// packets, and asserts the driver channel receives EXACTLY those payloads in order — the wire
+    /// packets, and asserts the driver channel receives EXACTLY those payloads in order, the wire
     /// contract path A relies on. An oversized length prefix (over MAX_FRAME_BYTES) must drop the
     /// connection (Down) without ever emitting a giant Data.
     fn run_serve_tcp(client_writes: impl FnOnce(&mut TcpStream) + Send + 'static) -> Vec<Ev> {
@@ -4419,7 +4419,7 @@ mod tcp_framing_tests {
     #[test]
     fn serve_tcp_delivers_length_framed_payloads_in_order() {
         // The raw-TCP bearer frames each link packet with a 4-byte BE length. serve_tcp must decode
-        // back the EXACT payloads, in order — a regression in the framing would corrupt every packet.
+        // back the EXACT payloads, in order: a regression in the framing would corrupt every packet.
         let evs = run_serve_tcp(|c| {
             c.write_all(&framed(b"hello")).unwrap();
             c.write_all(&framed(b"world!!")).unwrap();
@@ -4452,9 +4452,9 @@ mod tcp_framing_tests {
     fn serve_ws_dispatches_healthz_to_the_health_handler() {
         // serve_ws is the WS front-door handler: the accept loop peek-classifies, then serve_ws
         // dispatches. A Healthz kind must be answered by serve_healthz (a plain HTTP response), NOT
-        // fed into the WS driver — so a health probe on the $PORT front door works without a WS
+        // fed into the WS driver, so a health probe on the $PORT front door works without a WS
         // upgrade. Drive serve_ws(kind=Healthz) directly and assert an HTTP status line comes back.
-        // (Do NOT touch LAST_TICK_MS here — that global is owned by the serialized healthz_tests; we
+        // (Do NOT touch LAST_TICK_MS here, that global is owned by the serialized healthz_tests; we
         // only assert that SOME health HTTP response is produced, whatever the current tick state.)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4502,7 +4502,7 @@ mod tcp_framing_tests {
     #[test]
     fn serve_tcp_drops_a_frame_over_the_size_cap_without_emitting_it() {
         // services-05: an oversized length prefix (> MAX_FRAME_BYTES) must drop the connection rather
-        // than allocate/read a giant buffer — the DoS backstop. No Data is emitted for the bad frame;
+        // than allocate/read a giant buffer, the DoS backstop. No Data is emitted for the bad frame;
         // the loop breaks and the link goes Down. We send a length just over the cap and then bytes.
         let evs = run_serve_tcp(|c| {
             let bad_len = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
