@@ -816,6 +816,13 @@ fn usage_kv_key(hour: u64, tenant: &TenantId) -> String {
     format!("usage/{hour}/{}", hex_string(tenant))
 }
 
+/// Carriage-measurement row key: per (hour bucket, tenant), on a SEPARATE prefix from the billed
+/// `usage/` reach ledger. Deliberately separate: reach billing is live, and this row is measurement
+/// only, so it must never be summed into or parsed by the reach path.
+fn carriage_kv_key(hour: u64, tenant: &TenantId) -> String {
+    format!("carriage_usage/{hour}/{}", hex_string(tenant))
+}
+
 /// Ledger row value: `bundles` then `payload_bytes`, both u64 LE (16 bytes total).
 fn encode_usage(u: &Usage) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
@@ -843,9 +850,42 @@ fn merge_usage_into_store<S: Store>(
     drained: &[(TenantId, Usage)],
     now_ms: u64,
 ) -> usize {
+    merge_rows_into_store(store, drained, now_ms, usage_kv_key)
+}
+
+/// Read-modify-write the drained per-tenant CARRIAGE measurement into its own hour-bucketed rows.
+///
+/// This records real work the relay performed that the delivery-justified meter never charges for:
+/// bundles it accepted, stored, spooled, and forwarded which produced no delivery event (no
+/// returning ACK, no §39 vaccine), so `meter_delivered` never fired. §40 telemetry is the systematic
+/// case rather than an edge case: telemetry bundles set `request_ack: false`, the collector
+/// deliberately never responds, and they are `Destination::Device` so no vaccine fires, meaning NO
+/// telemetry bundle can ever produce a `hop_backbone_delivery`. The relay carries that traffic for
+/// free today.
+///
+/// This is MEASUREMENT ONLY. It is written to its own `carriage_usage/` prefix so it cannot disturb
+/// the live `usage/` reach ledger or its parser, it emits no Stripe event, and nothing bills off it.
+/// Whether any of this carriage should be priced (and on what unit) is the owner's decision; the
+/// point here is that the volume stops being invisible when someone goes to make it.
+fn merge_carriage_into_store<S: Store>(
+    store: &mut S,
+    drained: &[(TenantId, Usage)],
+    now_ms: u64,
+) -> usize {
+    merge_rows_into_store(store, drained, now_ms, carriage_kv_key)
+}
+
+/// The shared RMW body for both 16-byte ledger shapes. Only this node writes its own kv, so the
+/// read-modify-write is race-free.
+fn merge_rows_into_store<S: Store>(
+    store: &mut S,
+    drained: &[(TenantId, Usage)],
+    now_ms: u64,
+    key_for: fn(u64, &TenantId) -> String,
+) -> usize {
     let hour = now_ms / 3_600_000;
     for (tenant, usage) in drained {
-        let key = usage_kv_key(hour, tenant);
+        let key = key_for(hour, tenant);
         let mut total = store
             .get_kv(&key)
             .map(|b| decode_usage(&b))
@@ -914,10 +954,15 @@ fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
         ));
     }
 
+    // The three §35 axes are drained/sampled independently below, into three separate ledger
+    // prefixes, and must never be folded into one another: reach usage (`usage/`, drained,
+    // delivery-justified), unbilled carriage (`carriage_usage/`, drained, measurement only), and
+    // storage occupancy (`storage_usage/`, SAMPLED, non-draining).
+
     // §35 storage floor: integrate current occupancy (held sealed bytes per tenant) over the
-    // interval since the last sample into `storage_usage/` rows. This runs REGARDLESS of carriage
+    // interval since the last sample into `storage_usage/` rows. This runs REGARDLESS of delivery
     // activity, since a relay that is merely HOLDING bundles accrues storage even in an interval
-    // with no deliveries, so it precedes the carriage early-return below. The first sample only
+    // with no deliveries, so it precedes the reach-usage early-return below. The first sample only
     // seeds the clock (swap returns 0), so no bogus now-since-epoch interval is ever accrued.
     let last_sample = LAST_STORAGE_SAMPLE_MS.swap(now, Ordering::Relaxed);
     let dt = now.saturating_sub(last_sample);
@@ -928,6 +973,18 @@ fn flush_usage_now<S: Store>(node: &mut Node<S>, now: u64) {
             .map(|(t, bytes)| (t, bytes.saturating_mul(dt)))
             .collect();
         merge_storage_into_store(&mut node.store, &accrued, now);
+    }
+
+    // Unbilled carriage (measurement, separate prefix, no Stripe event). Drained on the same
+    // cadence as billing so a restart loses at most one interval of either. Like the storage
+    // sample, this precedes the reach-usage early-return: a relay can carry and release bundles
+    // in an interval that produced no billable delivery at all.
+    let carriage = node.take_carriage();
+    if !carriage.is_empty() {
+        let rows = merge_carriage_into_store(&mut node.store, &carriage, now);
+        netlog_private(format!(
+            "carriage: merged {rows} tenant row(s) of UNBILLED carriage (measurement only)"
+        ));
     }
 
     let drained = node.take_usage();
@@ -6242,6 +6299,105 @@ mod access_and_ledger_tests {
         assert_eq!(decode_usage(&encode_usage(&u)), u);
         assert_eq!(decode_usage(b"garbage"), Usage::default());
         assert_eq!(decode_usage(&[]), Usage::default());
+    }
+
+    #[test]
+    fn carriage_measurement_writes_its_own_prefix_and_never_the_reach_ledger() {
+        // Unbilled carriage is measured on a SEPARATE key prefix. The live `usage/` reach ledger
+        // (which really bills) must be untouched by it, and both share the 16-byte value shape.
+        let tenant: TenantId = [3u8; 16];
+        let hour = 77u64;
+        let now = hour * 3_600_000 + 5;
+        assert_eq!(
+            carriage_kv_key(hour, &tenant),
+            format!("carriage_usage/{hour}/{}", hex_string(&tenant))
+        );
+        assert_ne!(carriage_kv_key(hour, &tenant), usage_kv_key(hour, &tenant));
+
+        let mut store = MemoryStore::default();
+        let carried = Usage {
+            bundles: 4,
+            payload_bytes: 4096,
+        };
+        merge_carriage_into_store(&mut store, &[(tenant, carried)], now);
+        assert_eq!(
+            store
+                .get_kv(&carriage_kv_key(hour, &tenant))
+                .map(|b| decode_usage(&b)),
+            Some(carried)
+        );
+        assert!(
+            store.get_kv(&usage_kv_key(hour, &tenant)).is_none(),
+            "carriage must never write the billed reach ledger"
+        );
+        // RMW accumulates across flush windows, like the reach ledger.
+        merge_carriage_into_store(&mut store, &[(tenant, carried)], now);
+        assert_eq!(
+            store
+                .get_kv(&carriage_kv_key(hour, &tenant))
+                .map(|b| decode_usage(&b).bundles),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn telemetry_style_carriage_is_measured_but_never_billed() {
+        // End to end through the node: a stamped bundle the relay carries and releases without any
+        // delivery event (exactly what a §40 telemetry bundle does, since it sets request_ack:false,
+        // gets no response, and fires no vaccine) lands in carriage_usage and NOT in usage.
+        let key = Identity::generate();
+        let tenant: TenantId = [8u8; 16];
+        let now = 400 * hop_core::prelude::CARRIAGE_EPOCH_MS + 11;
+        let mut server = KeyServer::new();
+        server.insert(tenant, key.address());
+        let mut relay: Node<MemoryStore> = Node::new(Identity::generate());
+        relay.set_kind(NodeKind::Relay);
+        relay.set_time(now);
+        relay.set_access_policy(AccessPolicy::Keyed(KeyedAccess::new(
+            server,
+            Default::default(),
+        )));
+        relay.refresh_access();
+
+        // A stamping device originates telemetry addressed to a collector the relay carries toward.
+        let mut device: Node<MemoryStore> = Node::new(Identity::generate());
+        device.set_time(now);
+        device.set_stamper(Some(Stamper::new(
+            tenant,
+            Identity::from_secret_bytes(&key.to_secret_bytes()),
+        )));
+        let collector = Identity::generate();
+        let batch = hop_core::telemetry::TelemetryBatch::new().counter("hop.x", 1, now);
+        let id = device.send_telemetry(collector.address(), &batch).unwrap();
+        let carried = device.store.get(&id).expect("originated");
+        assert!(carried.env.access.is_some(), "stamped for attribution");
+
+        relay.ingest(carried);
+        assert!(relay.store.contains(&id), "the relay took custody");
+        // No ACK, no vaccine ever comes back. Eviction/expiry releases it.
+        relay.store.remove(&id);
+        relay.tick(now + 1);
+
+        assert!(
+            relay.take_usage().is_empty(),
+            "no delivery event, so the reach meter never bills it"
+        );
+        let carriage = relay.take_carriage();
+        assert_eq!(carriage.len(), 1, "but the carriage IS measured");
+        assert_eq!(carriage[0].0, tenant);
+        assert_eq!(carriage[0].1.bundles, 1);
+
+        // And it reaches the durable ledger on its own prefix, leaving the reach ledger empty.
+        let hour = now / 3_600_000;
+        merge_carriage_into_store(&mut relay.store, &carriage, now);
+        assert!(relay
+            .store
+            .get_kv(&carriage_kv_key(hour, &tenant))
+            .is_some());
+        assert!(
+            relay.store.get_kv(&usage_kv_key(hour, &tenant)).is_none(),
+            "unbilled carriage never touches the billed reach ledger"
+        );
     }
 
     #[test]
