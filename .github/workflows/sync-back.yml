@@ -35,4 +35,5 @@ jobs:
           gh workflow run sync-components.yml \
             --repo hopmesh/monorepo \
             -f component=hop-relayd \
-            -f direction=import
+            -f direction=import \
+            -f pr_number=${{ github.event.pull_request.number }}
