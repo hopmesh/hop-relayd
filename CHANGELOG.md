@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- revive dead ingest, fail closed, bound stamps, measure bytes and carriage (1912c75)
+- integrate the storage dimension onto current main (aedcfb2)
 - reap slowloris on raw-TCP and the WS handshake (ADV18-04/05) (4aab3fa)
 - retain mailbox custody until durable ingest (a16c38e)
 - close F-18d, HpsRekey fails safe under a mid-arm panic (#104) (879019b)
@@ -18,6 +20,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- purge em-dashes and en-dashes from source (d222435)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
 
 ### Dependencies
@@ -27,11 +30,16 @@ git-cliff. Do not edit by hand.
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
+- finish inbound (import), drop export_pr (41c095e)
+- §35 storage dimension, per-tenant held-byte occupancy (d58a544)
+- relays + collectors read tenant keys from the registry (5b-2, reader) (f80f5b3)
+- auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 - custody beacon (mode-1 HaveSet exchange) to cut duplicate-ingress COGS (708b565)
 - rotating key-hint carriage stamps (no tenant id on the wire) (a5e592d)
 - §35 carriage stamps - keyed relays, per-bundle metering (wire v8) (4aae50f)
 
 ### Other
+- rework the console deploy onto the new GitHub-is-change-management pipeline (b53b9d0)
 - box the envelope stamp (clippy large-variant), fmt, §35 addendum (6b601b6)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
 - SECURITY.md per component + enable-security in the bootstrap script (a1492e9)
