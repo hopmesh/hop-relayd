@@ -4739,12 +4739,6 @@ mod driver_tests {
         fn prune(&mut self, now_ms: u64) {
             self.0.prune(now_ms)
         }
-        fn split_copies(&mut self, id: &hop_core::bundle::BundleId) -> u16 {
-            self.0.split_copies(id)
-        }
-        fn set_copies(&mut self, id: &hop_core::bundle::BundleId, copies: u16) {
-            self.0.set_copies(id, copies)
-        }
         fn apply_kv_batch(
             &mut self,
             mutations: &[hop_core::store::KvMutation],
@@ -4797,12 +4791,6 @@ mod driver_tests {
             if let Some(prunes) = &self.prunes {
                 prunes.fetch_add(1, Ordering::AcqRel);
             }
-        }
-        fn split_copies(&mut self, id: &BundleId) -> u16 {
-            self.inner.split_copies(id)
-        }
-        fn set_copies(&mut self, id: &BundleId, copies: u16) {
-            self.inner.set_copies(id, copies)
         }
         fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
             self.inner.seen_expiry(id)
