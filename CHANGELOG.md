@@ -27,6 +27,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
@@ -39,6 +40,7 @@ git-cliff. Do not edit by hand.
 - §35 carriage stamps - keyed relays, per-bundle metering (wire v8) (4aae50f)
 
 ### Other
+- delete the dead copy-budget API and stop the simulator lying (9ab3138)
 - rework the console deploy onto the new GitHub-is-change-management pipeline (b53b9d0)
 - box the envelope stamp (clippy large-variant), fmt, §35 addendum (6b601b6)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
