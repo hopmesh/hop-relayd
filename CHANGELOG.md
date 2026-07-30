@@ -17,6 +17,7 @@ git-cliff. Do not edit by hand.
 - relayd F-18 test used the pre-F-06 mailbox_tag signature (firestore feature) (967a9a9)
 
 ### CI
+- stop a disarmed audit being permanently red, and a test using a timeout as control flow (8be22a0)
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
@@ -27,6 +28,8 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- correct claims stated more strongly than the code supports (CLAIM-001..009) (f3fbfbf)
+- regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
@@ -44,6 +47,10 @@ git-cliff. Do not edit by hand.
 - §35 carriage stamps - keyed relays, per-bundle metering (wire v8) (4aae50f)
 
 ### Other
+- say plainly that SVC-001's literal wording is not met, not that it is (133b36f)
+- make the writer-scoped ledger readable end to end, and stop overclaiming (5ee2555)
+- writer-scope the usage ledger rows so concurrent flushes compose (SVC-005) (b66cac9)
+- gate the live log fan-out, not just its backlog (SVC-001) (935cba3)
 - delete the dead copy-budget API and stop the simulator lying (9ab3138)
 - rework the console deploy onto the new GitHub-is-change-management pipeline (b53b9d0)
 - box the envelope stamp (clippy large-variant), fmt, §35 addendum (6b601b6)
