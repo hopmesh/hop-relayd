@@ -602,18 +602,55 @@ fn hms(ms: u64) -> String {
 //
 // services-03: the plain-HTTP log stream is UNAUTHENTICATED (anyone who opens
 // https://relay.hopme.sh gets it). For an "untraceable-by-default" network that is a free
-// traffic-analysis feed, so it is split two ways:
+// traffic-analysis feed, so it is split THREE ways:
 //
-//   * `netlog` (PUBLIC): safe, non-correlatable lines only: this node's identity, connection
-//     lifecycle by opaque link number, and AGGREGATE counters (peers=N held=M). These go to the
-//     ring + HTTP viewers + stderr.
-//   * `netlog_private` (OPERATOR): per-message metadata (bundle ids, destination addresses/regions,
-//     mailbox-tag prefixes, per-peer joins/leaves). These go ONLY to stderr / Cloud Logging, never
-//     to the ring or the public stream, so the world cannot correlate spool/pull timing to tags.
+//   * `netlog` (PUBLIC, ALWAYS): this node's identity, AGGREGATE counters (peers=N held=M), and its
+//     two once-per-process lifecycle lines. Emitted once per process or on a fixed timer, NEVER once
+//     per network event. These go to the ring + HTTP viewers + stderr in both flag states, because
+//     the flag-off contract still promises a viewer the identity header and periodic counters (and
+//     Cloud Run's non-WS probe reads them).
+//   * `netlog_event` (PUBLIC-SAFE, GATED): a line whose CONTENT carries nothing correlatable but
+//     which is emitted once per network event, so its TIMING alone is a traffic-analysis signal
+//     (relay-to-relay dial/close). Ring + HTTP viewers only when `HOP_PUBLIC_LOG_STREAM=1`; stderr
+//     always.
+//   * `netlog_private` (OPERATOR): per-message and per-peer metadata (bundle ids, destination
+//     addresses/regions, mailbox-tag prefixes, peer joins/leaves, and per-CONNECTION lifecycle).
+//     These go ONLY to stderr / Cloud Logging, never to the ring or the public stream, in either
+//     flag state, so the world cannot correlate spool/pull/attach timing to a device.
 //
-// The public stream is additionally OFF BY DEFAULT and only enabled by `HOP_PUBLIC_LOG_STREAM=1`.
-// When off, a visitor still gets a healthy 200 with the identity header and live aggregate counters
-// (so Cloud Run's non-WS probes stay happy), but no per-event line feed at all.
+// services-r19-01 (SVC-001) is why the second class exists at all. The gate used to live ONLY on the
+// historical ring in `subscribe()`: the live fan-out was unconditional, so with the flag OFF an
+// anonymous visitor was served a note saying only aggregate counters were shown, and then handed every
+// `conn up: link=N` / `conn down: link=N` line as devices attached and detached. The gate now lives
+// on the WRITE path (`emit`), and connection lifecycle moved to `netlog_private` outright: a line
+// emitted once per peer connect/disconnect is per-event metadata regardless of the flag.
+//
+// The public per-event stream is OFF BY DEFAULT and only enabled by `HOP_PUBLIC_LOG_STREAM=1`.
+// When off, a visitor gets a healthy 200 with the identity header, live aggregate counters (so
+// Cloud Run's non-WS probes stay happy), this process's two lifecycle lines, and no per-event
+// line at all.
+//
+// RESIDUAL, recorded rather than papered over (SVC-001). SVC-001's invariant is worded "the identity
+// header and aggregate counters ONLY", and that literal wording is NOT met. Two lines on the
+// always-public channel are neither identity nor a counter: `relay up: region=.. node=..` at startup
+// and `SIGTERM: durable-store flush .., exiting` at exit. A viewer holding a flag-off connection
+// across this process's start or its shutdown receives them. What IS met is the substantive half of
+// the invariant, the half the finding was actually about: no line emitted per network event reaches an
+// anonymous visitor, because both of these fire exactly ONCE per process and therefore carry no
+// per-network-event timing. The served note in `serve_log_stream_for` now says exactly that instead of
+// claiming counters alone, so nothing a visitor reads is false; the invariant's own wording is the
+// thing that is looser than the code, not the reverse. If someone wants the literal wording honoured,
+// the fix is to route both lines to `netlog_private` and accept that a public viewer learns nothing
+// about process lifecycle. That is not done here because the identity line is already in the header
+// the same handler writes, so removing it from the stream would hide nothing.
+//
+// SECOND RESIDUAL: the classification guard (`netlog_call_sites_are_identity_or_aggregate_only`)
+// checks the prefix of the FIRST string literal of each call site's argument and nothing else. It
+// catches a new call site whose line starts with an unapproved prefix, and it rejects a non-literal
+// argument outright, but it cannot vouch for what a `format!` INTERPOLATES after that prefix. A
+// reviewer adding a per-peer value into an existing approved line (say `stats: peers=.. last={addr}`)
+// would pass the guard. The prefix list is the review contract; the guard enforces its shape, not its
+// spirit.
 // ---------------------------------------------------------------------------
 
 /// Is the public per-event log stream enabled? Off by default (services-03); operators opt in with
@@ -628,8 +665,20 @@ fn public_log_stream_enabled() -> bool {
 // Tests that mutate the process-global HOP_PUBLIC_LOG_STREAM env var live in separate test modules
 // but share one process; Rust runs test fns in parallel threads, so they would otherwise race on the
 // var (one test's set_var flips the flag mid-assert in another). Serialize them on this shared lock.
+// Take it through [`lock_public_log_env`], never `.lock().unwrap()`: an assertion failure inside the
+// guard's scope poisons the mutex, and an unwrapping sibling then fails on PoisonError instead of its
+// own assertion, so one real failure reports as several unrelated ones and hides which test broke.
 #[cfg(test)]
 static PUBLIC_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize on [`PUBLIC_LOG_ENV_LOCK`], recovering from poisoning so one failing assertion reports
+/// ITS failure and does not cascade into every other env-mutating test.
+#[cfg(test)]
+fn lock_public_log_env() -> std::sync::MutexGuard<'static, ()> {
+    PUBLIC_LOG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
 
 // Serializes tests that read/write the process-global driver statics (LAST_TICK_MS, SHUTDOWN) so a
 // concurrent test can't observe another's transient value (e.g. driver_step storing a fresh tick
@@ -659,11 +708,25 @@ impl LogHub {
         self.inner.lock().unwrap().who = who;
     }
 
-    /// Emit a PUBLIC-safe line: ring + HTTP viewers + stderr. Only non-correlatable lines
-    /// (identity, link lifecycle, aggregate counters) may go here, see the module note.
-    fn emit(&self, line: String) {
+    /// Emit a line to stderr and, subject to the per-event gate, to the ring + HTTP viewers.
+    ///
+    /// `per_event` marks a line emitted once per network event. Those reach the ring and the live
+    /// viewers ONLY when `HOP_PUBLIC_LOG_STREAM=1`; with the flag off they stop at stderr, so the
+    /// flag-off viewer receives no line that is emitted per network event.
+    ///
+    /// `per_event = false` lines always fan out, in both flag states, and that set is exactly what
+    /// the note in `serve_log_stream_for` promises: this node's identity, its aggregate counters, and
+    /// its two once-per-process lifecycle lines (`relay up:`, `SIGTERM:`). Those last two are the
+    /// recorded residual on SVC-001's "counters only" wording; the block comment above says why they
+    /// stay here.
+    fn emit(&self, line: String, per_event: bool) {
         let stamped = format!("{} {}", hms(now_ms()), line);
         eprintln!("{stamped}");
+        // services-r19-01 (SVC-001): the gate is on the WRITE path, not just on the historical ring
+        // handed to a new subscriber. Gating only the backlog left the live fan-out wide open.
+        if per_event && !public_log_stream_enabled() {
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
         g.ring.push_back(stamped.clone());
         while g.ring.len() > 400 {
@@ -702,10 +765,23 @@ fn log_hub() -> &'static LogHub {
     })
 }
 
-/// Emit a PUBLIC-safe line to the live network log (ring + HTTP viewers + stderr). Use only for
-/// non-correlatable lines; per-message metadata MUST use [`netlog_private`] (services-03).
+/// Emit an ALWAYS-PUBLIC line to the live network log (ring + HTTP viewers + stderr).
+///
+/// Restricted to this node's identity and AGGREGATE counters, because these lines are served to an
+/// anonymous visitor even with the public per-event stream OFF. Anything emitted once per network
+/// event MUST use [`netlog_event`]; per-message or per-peer metadata MUST use [`netlog_private`]
+/// (services-03, services-r19-01). `netlog_call_sites_are_identity_or_aggregate_only` enforces this
+/// over the source, so a new call site cannot quietly widen the always-public channel.
 fn netlog(line: impl Into<String>) {
-    log_hub().emit(line.into());
+    log_hub().emit(line.into(), false);
+}
+
+/// Emit a PUBLIC-SAFE but PER-EVENT line: stderr always, ring + HTTP viewers only when
+/// `HOP_PUBLIC_LOG_STREAM=1`. The content carries nothing correlatable to a device, but one line per
+/// network event makes its TIMING a traffic-analysis signal, so it rides the opt-in gate.
+#[cfg_attr(not(feature = "firestore"), allow(dead_code))]
+fn netlog_event(line: impl Into<String>) {
+    log_hub().emit(line.into(), true);
 }
 
 /// Emit an OPERATOR-only line: stderr / Cloud Logging ONLY, never the public HTTP stream or ring
@@ -811,16 +887,64 @@ static LAST_USAGE_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
 /// first sample only SEEDS the clock and accrues nothing (there is no prior interval to integrate).
 static LAST_STORAGE_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 
-/// One ledger row key: per (hour bucket, tenant).
+/// This process's ledger WRITER id: 8 random bytes as 16 lowercase-hex chars, minted once per
+/// process (services-r19-05 / SVC-005).
+///
+/// Ledger rows used to be keyed per (hour, tenant) alone, with the merge documented as "race-free"
+/// because "only this node writes its own kv". That premise is a deployment property, not a
+/// structural one, and the deployment does not guarantee it: a Cloud Run revision rollout runs the
+/// old and new instance of a region concurrently, both mount the same `hop-relay-identity` secret
+/// and take the same `--region`, so both derive the SAME node address and open the SAME Firestore
+/// partition. The read half of the read-modify-write reads the process-LOCAL in-memory copy, never
+/// the durable row, so the later flush wrote its own base plus its own delta and silently discarded
+/// the other process's contribution. Revenue loss, one-directional, invisible: hop-billingd lists
+/// the partition, sees no failure, emits the clobbered total and advances the watermark past the
+/// hour.
+///
+/// Scoping the row by writer makes the composition structural instead of premised. Two processes
+/// sharing a partition now write DISJOINT rows and cannot clobber each other; the reconciler already
+/// sums duplicate (hour, tenant) rows across sources, so the total is the sum of every writer's
+/// contribution by construction. No lease, no fence, no distributed transaction.
+///
+/// COST, stated without softening: row cardinality grows by one per (hour, tenant) per process
+/// incarnation, so a restart-heavy hour costs a handful of extra 16-byte docs, and those rows
+/// ACCUMULATE. Nothing sweeps them. `kv_doc_json` in hop-store-firestore writes only `key` and
+/// `value`, with no `expireAt` field, so the collection's TTL policy never reaps a kv doc; the §37
+/// reconciler reads rows from a watermark and never deletes them; and no prune path touches the
+/// `usage/`, `carriage_usage/`, `storage_usage/` or `telemetry_usage/` prefixes. Unbounded ledger
+/// growth is therefore a PRE-EXISTING property of this ledger (a three-segment row accumulated
+/// forever too); writer-scoping multiplies the row count for an hour by the number of processes that
+/// wrote it, which is one in steady state and a small handful across a rollout. A retention sweep for
+/// reconciled hours is real outstanding work, tracked as the residual on SVC-005, and this comment
+/// will keep saying "accumulate" until that sweep exists.
+fn ledger_writer_id() -> &'static str {
+    static WRITER_ID: OnceLock<String> = OnceLock::new();
+    // Identity::generate draws from the OS CSPRNG; take 8 bytes of a throwaway address rather than
+    // adding an rng dependency for 64 bits. Collision between two live processes is ~2^-64.
+    WRITER_ID.get_or_init(|| hex_string(&Identity::generate().address()[..8]))
+}
+
+/// One ledger row key for an explicit writer. Split out from [`usage_kv_key`] so a test can stand up
+/// two DIFFERENT writers in one process and prove their rows compose rather than clobber.
+fn usage_kv_key_for(hour: u64, tenant: &TenantId, writer: &str) -> String {
+    format!("usage/{hour}/{}/{writer}", hex_string(tenant))
+}
+
+/// One ledger row key: per (hour bucket, tenant, writer). See [`ledger_writer_id`] for why the
+/// writer segment exists; hop-billingd's `parse_row` accepts it and sums the rows.
 fn usage_kv_key(hour: u64, tenant: &TenantId) -> String {
-    format!("usage/{hour}/{}", hex_string(tenant))
+    usage_kv_key_for(hour, tenant, ledger_writer_id())
 }
 
 /// Carriage-measurement row key: per (hour bucket, tenant), on a SEPARATE prefix from the billed
 /// `usage/` reach ledger. Deliberately separate: reach billing is live, and this row is measurement
 /// only, so it must never be summed into or parsed by the reach path.
 fn carriage_kv_key(hour: u64, tenant: &TenantId) -> String {
-    format!("carriage_usage/{hour}/{}", hex_string(tenant))
+    format!(
+        "carriage_usage/{hour}/{}/{}",
+        hex_string(tenant),
+        ledger_writer_id()
+    )
 }
 
 /// Ledger row value: `bundles` then `payload_bytes`, both u64 LE (16 bytes total).
@@ -843,8 +967,8 @@ fn decode_usage(bytes: &[u8]) -> Usage {
     }
 }
 
-/// Read-modify-write the drained per-tenant usage into the hour-bucketed ledger rows. Only this
-/// node writes its own kv, so the RMW is race-free. Returns the number of rows touched.
+/// Read-modify-write the drained per-tenant usage into this writer's hour-bucketed ledger rows.
+/// Returns the number of rows touched. See [`merge_rows_into_store`] for the concurrency premise.
 fn merge_usage_into_store<S: Store>(
     store: &mut S,
     drained: &[(TenantId, Usage)],
@@ -875,13 +999,20 @@ fn merge_carriage_into_store<S: Store>(
     merge_rows_into_store(store, drained, now_ms, carriage_kv_key)
 }
 
-/// The shared RMW body for both 16-byte ledger shapes. Only this node writes its own kv, so the
-/// read-modify-write is race-free.
+/// The shared RMW body for both 16-byte ledger shapes.
+///
+/// The premise this depends on, stated exactly (services-r19-05 / SVC-005): the read half reads the
+/// process-LOCAL in-memory kv copy, not the durable row, so this merge is safe ONLY against a row no
+/// other process writes. It used to claim "only this node writes its own kv, so the RMW is
+/// race-free", which is false whenever two processes share a node address, and a Cloud Run revision
+/// rollout does exactly that. The row key now carries [`ledger_writer_id`], so the row this merge
+/// owns is private to THIS process and the premise holds structurally rather than by deployment
+/// convention. Concurrent writers compose because the reconciler sums the per-writer rows.
 fn merge_rows_into_store<S: Store>(
     store: &mut S,
     drained: &[(TenantId, Usage)],
     now_ms: u64,
-    key_for: fn(u64, &TenantId) -> String,
+    key_for: impl Fn(u64, &TenantId) -> String,
 ) -> usize {
     let hour = now_ms / 3_600_000;
     for (tenant, usage) in drained {
@@ -896,12 +1027,16 @@ fn merge_rows_into_store<S: Store>(
     drained.len()
 }
 
-/// One storage-occupancy row key: per (hour bucket, tenant). A SEPARATE prefix from `usage/` on
-/// purpose (§35 header rule: only ever ADD fields by a new key prefix, never re-shape the 16-byte
+/// One storage-occupancy row key: per (hour bucket, tenant, writer). A SEPARATE prefix from `usage/`
+/// on purpose (§35 header rule: only ever ADD fields by a new key prefix, never re-shape the 16-byte
 /// carriage value in place). Mirrors the `telemetry_usage/` precedent; a reader that predates it
-/// simply ignores the unknown prefix.
+/// simply ignores the unknown prefix. The writer segment is [`ledger_writer_id`] (SVC-005).
 fn storage_usage_kv_key(hour: u64, tenant: &TenantId) -> String {
-    format!("storage_usage/{hour}/{}", hex_string(tenant))
+    format!(
+        "storage_usage/{hour}/{}/{}",
+        hex_string(tenant),
+        ledger_writer_id()
+    )
 }
 
 /// Storage row value: accrued occupancy in byte-milliseconds, u64 LE (8 bytes). Anything malformed
@@ -916,8 +1051,9 @@ fn decode_storage(bytes: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-/// RMW the accrued per-tenant byte-milliseconds into the hour-bucketed storage rows. Only this node
-/// writes its own kv, so the RMW is race-free. Zero-accrual tenants are skipped. Returns rows touched.
+/// RMW the accrued per-tenant byte-milliseconds into this writer's hour-bucketed storage rows. The
+/// row is writer-scoped (SVC-005), so no other process can clobber it and totals compose by summing.
+/// Zero-accrual tenants are skipped. Returns rows touched.
 fn merge_storage_into_store<S: Store>(
     store: &mut S,
     accrued: &[(TenantId, u64)],
@@ -1140,8 +1276,14 @@ fn serve_log_stream_for(mut stream: TcpStream, maximum_ms: u64) {
     // per-message lines. Serve only a note that live metadata is private; the caller stays a healthy
     // 200 with periodic public aggregate lines (peers=N held=M) still arriving via the subscription.
     if !public_log_stream_enabled() {
+        // The note names the always-public vocabulary EXACTLY, including the two once-per-process
+        // lifecycle lines. It used to say "only aggregate counters", which a viewer connected across
+        // this process's start or its SIGTERM would have caught out (see the residual recorded in the
+        // log-hub block above). Widening the sentence to what actually ships beats a tidier sentence
+        // that is false one line per process lifetime.
         let note =
-            "live per-event log is private on this relay; only aggregate counters are shown \
+            "live per-event log is private on this relay; only this node's identity, its aggregate \
+                    counters, and its once-per-process start/stop lines are shown \
                     (set HOP_PUBLIC_LOG_STREAM=1 to expose per-event lines)\n";
         if stream.write_all(note.as_bytes()).is_err() {
             return;
@@ -1408,7 +1550,10 @@ fn apply_event<S: Store>(
     match ev {
         Ev::Up(link, role, out) => {
             writers.insert(link, out);
-            netlog(format!("conn up: link={link} ({role:?})"));
+            // services-r19-01 (SVC-001): a line emitted once per peer connect is per-event device
+            // metadata (an attach/detach oracle at sub-second resolution) regardless of the public
+            // flag, so it is OPERATOR-only, like `peer connected` / `peer left` below.
+            netlog_private(format!("conn up: link={link} ({role:?})"));
             guard_core("bearer-connected", || {
                 node.handle(BearerEvent::Connected(link, role))
             });
@@ -1426,7 +1571,7 @@ fn apply_event<S: Store>(
             // and a `PeerRateKey::Peer` entry for whoever this link belonged to is deliberately left in
             // place so a same-window reconnect cannot reset that identity's budget. The map is bounded by
             // the staleness sweep + the MAX_PEER_RATE_KEYS hard ceiling in `peer_data_allowed`.
-            netlog(format!("conn down: link={link}"));
+            netlog_private(format!("conn down: link={link}"));
             guard_core("bearer-disconnected", || {
                 node.handle(BearerEvent::Disconnected(link))
             });
@@ -2197,7 +2342,7 @@ fn dial_peer(url: &str, ev_tx: &EventTx) {
         match tungstenite::client::connect_with_config(url, Some(ws_bearer_config()), 3) {
             Ok(c) => c,
             Err(e) => {
-                netlog(format!("peer: {url} unreachable ({e})"));
+                netlog_event(format!("peer: {url} unreachable ({e})"));
                 return;
             }
         };
@@ -2215,7 +2360,7 @@ fn dial_peer(url: &str, ev_tx: &EventTx) {
     if ev_tx.send(Ev::Up(link, Role::Initiator, out_tx)).is_err() {
         return;
     }
-    netlog(format!("peer: dialed {url} (link {link})"));
+    netlog_event(format!("peer: dialed {url} (link {link})"));
     'conn: loop {
         loop {
             match out_rx.try_recv() {
@@ -2260,7 +2405,7 @@ fn dial_peer(url: &str, ev_tx: &EventTx) {
         }
     }
     let _ = ev_tx.send(Ev::Down(link));
-    netlog(format!("peer: link {link} to {url} closed"));
+    netlog_event(format!("peer: link {link} to {url} closed"));
 }
 
 /// Pick the store backend: durable per-node Firestore (scale-to-zero) when built with
@@ -3209,7 +3354,7 @@ mod log_privacy_tests {
         // routed through the hub (netlog_private goes only to stderr).
         let hub = fresh_hub();
         let (_who, _backlog, rx) = hub.subscribe();
-        hub.emit("stats: peers=3 held=7".to_string());
+        hub.emit("stats: peers=3 held=7".to_string(), false);
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("public line delivered to viewer");
@@ -3229,7 +3374,7 @@ mod log_privacy_tests {
         let hub = fresh_hub();
         let (_who, _backlog, rx) = hub.subscribe();
         for i in 0..(MAX_LOG_SUBSCRIBER_LINES + 50) {
-            hub.emit(format!("line {i}"));
+            hub.emit(format!("line {i}"), false);
         }
 
         let mut received = 0;
@@ -3238,7 +3383,7 @@ mod log_privacy_tests {
         }
         assert_eq!(received, MAX_LOG_SUBSCRIBER_LINES);
 
-        hub.emit("after drain".to_string());
+        hub.emit("after drain".to_string(), false);
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap()
@@ -3254,10 +3399,10 @@ mod log_privacy_tests {
         // set in the test process, so subscribe() returns an empty backlog even with a full ring.
         // Hold the shared env lock: a parallel test mutating HOP_PUBLIC_LOG_STREAM would otherwise
         // flip the flag between remove_var and subscribe().
-        let _env = super::PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        let _env = super::lock_public_log_env();
         let hub = fresh_hub();
-        hub.emit("conn up: link=1 (Responder)".to_string());
-        hub.emit("stats: peers=1 held=0".to_string());
+        hub.emit("peer: dialed wss://x/ (link 1)".to_string(), true);
+        hub.emit("stats: peers=1 held=0".to_string(), false);
         std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
         let (_who, backlog, _rx) = hub.subscribe();
         assert!(
@@ -3274,10 +3419,10 @@ mod log_privacy_tests {
         // can't grow without bound; and with the public stream ON, a new viewer's subscribe() returns
         // that capped ring as its backlog (services-03). Serialize on the env lock (subscribe reads
         // the global HOP_PUBLIC_LOG_STREAM flag).
-        let _env = super::PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        let _env = super::lock_public_log_env();
         let hub = fresh_hub();
         for i in 0..450 {
-            hub.emit(format!("line {i}"));
+            hub.emit(format!("line {i}"), false);
         }
         std::env::set_var("HOP_PUBLIC_LOG_STREAM", "1");
         let (_who, backlog, _rx) = hub.subscribe();
@@ -4129,7 +4274,7 @@ mod pure_helper_tests {
         // truthy values enable it, everything else (incl. unset) leaves it off.
         // Hold the shared env lock so this test's set_var can't race a parallel test that reads the
         // flag via subscribe().
-        let _env = PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        let _env = lock_public_log_env();
         for v in ["1", "true", "yes"] {
             std::env::set_var("HOP_PUBLIC_LOG_STREAM", v);
             assert!(public_log_stream_enabled(), "{v} enables the public stream");
@@ -6093,7 +6238,7 @@ mod log_stream_public_tests {
         // serve_log_stream over a real socket against the global hub. Terminate robustly by closing the
         // client then emitting one more line (its failed write breaks the loop), so the test does not
         // depend on the deadline (which a parallel test could perturb via the env seam).
-        let _env = PUBLIC_LOG_ENV_LOCK.lock().unwrap();
+        let _env = lock_public_log_env();
         std::env::set_var("HOP_PUBLIC_LOG_STREAM", "1");
         // NB: deliberately do NOT set HOP_LOG_STREAM_MAX_MS. That env seam is owned by the
         // CONN_TEST_LOCK log-stream tests (a different lock); writing it here would race them. This
@@ -6101,7 +6246,7 @@ mod log_stream_public_tests {
         // of whatever deadline is in effect.
 
         // Seed a distinctive backlog line into the GLOBAL ring BEFORE the viewer connects.
-        netlog("PLS-BACKLOG stats: peers=1 held=0");
+        netlog("stats: PLS-BACKLOG peers=1 held=0");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6120,7 +6265,7 @@ mod log_stream_public_tests {
 
         // Emit a live line after the viewer has had a moment to subscribe (recv-line path).
         std::thread::sleep(Duration::from_millis(120));
-        netlog("PLS-LIVE stats: peers=2 held=1");
+        netlog("stats: PLS-LIVE peers=2 held=1");
 
         // Read for up to ~3s or until both markers are seen.
         let mut text = String::new();
@@ -6158,7 +6303,7 @@ mod log_stream_public_tests {
         client.shutdown(std::net::Shutdown::Both).ok();
         drop(client);
         for _ in 0..5 {
-            netlog("PLS-DRAIN tick");
+            netlog("stats: PLS-DRAIN tick");
             if server.is_finished() {
                 break;
             }
@@ -6166,6 +6311,226 @@ mod log_stream_public_tests {
         }
         server.join().unwrap();
         std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+    }
+}
+
+/// services-r19-01 (SVC-001): with `HOP_PUBLIC_LOG_STREAM` UNSET, an anonymous viewer must receive
+/// the identity header and aggregate counters and NOTHING that is emitted per network event. These
+/// tests fail against the pre-fix code, where the gate lived only on the historical ring and the
+/// live fan-out was unconditional.
+#[cfg(test)]
+mod log_stream_flag_off_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    /// Drive a real viewer socket through `serve_log_stream` while `apply_event` pushes one link up
+    /// and one link down through a real `Node`, then return everything the viewer received.
+    fn viewer_bytes_while_links_flap() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve_log_stream(sock);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        // Let the handler subscribe before anything is emitted.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // A device attaches and detaches: exactly the Ev::Up / Ev::Down pair the finding cites.
+        let mut node = Node::with_store(Identity::generate(), MemoryStore::new());
+        let mut writers: HashMap<u64, SyncSender<Vec<u8>>> = HashMap::new();
+        let (out_tx, _out_rx) = mpsc::sync_channel(MAX_OUTBOUND_FRAMES_PER_LINK);
+        apply_event(
+            &mut node,
+            &mut writers,
+            Ev::Up(8412, Role::Responder, out_tx),
+        );
+        apply_event(&mut node, &mut writers, Ev::Down(8412));
+        // A relay-to-relay dial line: public-safe content, but per-event, so also gated.
+        netlog_event("peer: dialed wss://eu.example/ (link 9)");
+        // The aggregate counter line the flag-off contract still promises (maybe_emit_stats emits
+        // exactly this shape; last_stats_ms = 0 with a now past the 10s threshold fires it).
+        maybe_emit_stats(&node, 0, 20_000);
+
+        let mut text = String::new();
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 2048];
+        while start.elapsed() < Duration::from_secs(2) {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if text.contains("stats: peers=") {
+                        break;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+
+        // Terminate the handler deterministically: close the client, then emit always-public lines
+        // whose failed write breaks the loop (independent of the deadline).
+        client.shutdown(std::net::Shutdown::Both).ok();
+        drop(client);
+        for _ in 0..10 {
+            netlog("stats: drain tick");
+            if server.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        server.join().unwrap();
+        text
+    }
+
+    #[test]
+    fn flag_off_viewer_never_sees_a_per_event_line_but_still_gets_identity_and_counters() {
+        let _env = lock_public_log_env();
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        let text = viewer_bytes_while_links_flap();
+
+        assert!(
+            !text.contains("conn up"),
+            "a connect line must never reach an anonymous viewer with the stream off: {text}"
+        );
+        assert!(
+            !text.contains("conn down"),
+            "a disconnect line must never reach an anonymous viewer with the stream off: {text}"
+        );
+        assert!(
+            !text.contains("peer: dialed"),
+            "a per-event backbone dial line is gated too: {text}"
+        );
+        // The flag-off contract the served note states, preserved: identity + aggregate counters.
+        assert!(
+            text.contains("== hop relay ::"),
+            "the identity header is still served: {text}"
+        );
+        assert!(
+            text.contains("live per-event log is private on this relay"),
+            "the note is still served: {text}"
+        );
+        assert!(
+            text.contains("stats: peers="),
+            "aggregate counters still reach the viewer (Cloud Run's non-WS probe path): {text}"
+        );
+    }
+
+    #[test]
+    fn per_event_lines_reach_the_ring_and_subscribers_only_when_the_flag_is_on() {
+        let _env = lock_public_log_env();
+        let hub = LogHub {
+            inner: Mutex::new(LogInner {
+                who: String::new(),
+                ring: VecDeque::new(),
+                subs: Vec::new(),
+            }),
+        };
+        let (_who, _backlog, rx) = hub.subscribe();
+
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        hub.emit("peer: dialed wss://x/ (link 1)".to_string(), true);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a per-event line is withheld from the live fan-out when the flag is off"
+        );
+        assert!(
+            hub.inner.lock().unwrap().ring.is_empty(),
+            "and it never enters the ring, so a later subscriber cannot replay it"
+        );
+        // An always-public line still flows in the same (flag-off) state.
+        hub.emit("stats: peers=1 held=0".to_string(), false);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .contains("peers=1 held=0"),
+            "aggregate counters are not gated"
+        );
+
+        std::env::set_var("HOP_PUBLIC_LOG_STREAM", "1");
+        hub.emit("peer: dialed wss://y/ (link 2)".to_string(), true);
+        let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::env::remove_var("HOP_PUBLIC_LOG_STREAM");
+        assert!(
+            got.contains("peer: dialed wss://y/"),
+            "with the flag on, per-event lines stream as documented"
+        );
+    }
+
+    /// The classification guard the closure contract asks for: every `netlog` call site in this
+    /// file (the ALWAYS-PUBLIC channel, served even with the stream off) must emit only this node's
+    /// identity, an aggregate counter, or a once-per-process lifecycle line. Anything per-peer,
+    /// per-connection or per-message belongs on `netlog_private`; anything public-safe but per-event
+    /// belongs on `netlog_event`. Reading the source is the point: a reviewer can forget the rule,
+    /// this test cannot.
+    ///
+    /// WHAT THIS GUARD DOES NOT CHECK, stated plainly so nobody trusts it further than it goes: it
+    /// reads the FIRST string literal of each call site's argument and matches its PREFIX against
+    /// `ALLOWED`. It therefore catches a new call site with an unapproved prefix, and it rejects a
+    /// computed (non-literal) argument outright, but it cannot see what a `format!` interpolates after
+    /// that prefix. Widening an already-approved line (`stats: peers={n} peer={addr}`) passes. The
+    /// prefix list is the review contract; this test enforces its shape, not its spirit.
+    #[test]
+    fn netlog_call_sites_are_identity_or_aggregate_only() {
+        const SOURCE: &str = include_str!("main.rs");
+        // Prefixes of the ALWAYS-PUBLIC vocabulary. Extend this list only with a line that is
+        // emitted once per process or on a fixed timer and names no peer, link, bundle or address.
+        const ALLOWED: &[&str] = &["relay up:", "stats:", "SIGTERM:"];
+
+        // The token, assembled at runtime so this test's own source cannot match it.
+        let call = format!("netlog{}", "(");
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        let mut sites = 0;
+        let mut offenders: Vec<String> = Vec::new();
+        for (line_no, raw) in lines.iter().enumerate() {
+            let line = raw.trim_start();
+            // Comments and the declaration itself describe the rule; they are not call sites.
+            if line.starts_with("//") || line.starts_with("fn netlog") {
+                continue;
+            }
+            let Some(index) = line.find(&call) else {
+                continue;
+            };
+            // `netlog_private` and `netlog_event` are different tokens and never match here.
+            let mut rest = line[index + call.len()..].trim_start();
+            rest = rest.strip_prefix("format!(").unwrap_or(rest).trim_start();
+            // rustfmt wraps a long `format!` so the literal lands on the following line.
+            if rest.is_empty() {
+                rest = lines.get(line_no + 1).map(|l| l.trim_start()).unwrap_or("");
+            }
+            // The argument opens as a string literal; anything else is a computed line whose
+            // content this guard cannot vouch for, and is rejected outright.
+            sites += 1;
+            let Some(body) = rest.strip_prefix('"') else {
+                offenders.push(format!("line {}: non-literal argument", line_no + 1));
+                continue;
+            };
+            let literal = &body[..body.find('"').unwrap_or(0)];
+            if !ALLOWED.iter().any(|p| literal.starts_with(p)) {
+                offenders.push(format!("line {}: {literal}", line_no + 1));
+            }
+        }
+        assert!(
+            sites >= 6,
+            "the scan found only {sites} always-public call sites; it has drifted from the source"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the always-public channel carries identity + aggregate counters only. \
+             Move these to the per-event or the operator-only channel: {offenders:?}"
+        );
     }
 }
 
@@ -6299,7 +6664,11 @@ mod access_and_ledger_tests {
         let now = hour * 3_600_000 + 5;
         assert_eq!(
             carriage_kv_key(hour, &tenant),
-            format!("carriage_usage/{hour}/{}", hex_string(&tenant))
+            format!(
+                "carriage_usage/{hour}/{}/{}",
+                hex_string(&tenant),
+                ledger_writer_id()
+            )
         );
         assert_ne!(carriage_kv_key(hour, &tenant), usage_kv_key(hour, &tenant));
 
@@ -6505,5 +6874,185 @@ mod access_and_ledger_tests {
         // Storage rows are under their own prefix, never mixed with carriage rows.
         assert_eq!(store.list_kv("storage_usage/").len(), 2);
         assert_eq!(store.list_kv("usage/").len(), 0);
+    }
+
+    // --- services-r19-05 (SVC-005): two processes over one partition -----------------------------
+
+    /// A store handle with `FirestoreStore`'s exact concurrency shape: the READ half answers from
+    /// this process's in-memory copy (loaded once at open), while every write mirrors through to the
+    /// shared durable partition. That asymmetry is the whole defect: a second process never sees the
+    /// first's write, so a read-modify-write on a SHARED row silently discards it.
+    struct PartitionHandle {
+        local: MemoryStore,
+        durable: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl PartitionHandle {
+        /// Open a handle onto `durable`, eagerly loading the rows that exist now (what the real
+        /// store does at open, and why a process that started earlier holds a stale base).
+        fn open(durable: &Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>) -> Self {
+            let mut local = MemoryStore::new();
+            for (key, value) in durable.lock().unwrap().iter() {
+                local.put_kv(key, value.clone());
+            }
+            Self {
+                local,
+                durable: Arc::clone(durable),
+            }
+        }
+    }
+
+    impl Store for PartitionHandle {
+        fn put(&mut self, b: Bundle, now_ms: u64) -> bool {
+            self.local.put(b, now_ms)
+        }
+        fn get(&self, id: &BundleId) -> Option<Bundle> {
+            self.local.get(id)
+        }
+        fn remove(&mut self, id: &BundleId) -> Option<Bundle> {
+            self.local.remove(id)
+        }
+        fn seen(&self, id: &BundleId) -> bool {
+            self.local.seen(id)
+        }
+        fn contains(&self, id: &BundleId) -> bool {
+            self.local.contains(id)
+        }
+        fn have(&self) -> hop_core::store::HaveSet {
+            self.local.have()
+        }
+        fn prune(&mut self, now_ms: u64) {
+            self.local.prune(now_ms)
+        }
+        fn apply_kv_batch(
+            &mut self,
+            mutations: &[hop_core::store::KvMutation],
+        ) -> std::result::Result<(), String> {
+            self.local.apply_kv_batch(mutations)
+        }
+        fn put_kv_critical(
+            &mut self,
+            key: &str,
+            value: Vec<u8>,
+        ) -> std::result::Result<(), String> {
+            self.put_kv(key, value);
+            Ok(())
+        }
+        fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+            self.local.remove_kv_critical(key)
+        }
+        fn put_kv(&mut self, key: &str, value: Vec<u8>) {
+            self.durable
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.clone());
+            self.local.put_kv(key, value);
+        }
+        fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+            // Deliberately the PROCESS-LOCAL copy, never the durable row.
+            self.local.get_kv(key)
+        }
+    }
+
+    /// Sum every `usage/` row in the durable partition the way hop-billingd's reconciler does
+    /// (duplicate (hour, tenant) rows are summed across sources).
+    fn durable_usage_total(
+        durable: &Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        hour: u64,
+        tenant: &TenantId,
+    ) -> Usage {
+        let want = format!("usage/{hour}/{}", hex_string(tenant));
+        let mut total = Usage::default();
+        for (key, value) in durable.lock().unwrap().iter() {
+            if key == &want || key.starts_with(&format!("{want}/")) {
+                total.add(&decode_usage(value));
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn two_processes_sharing_one_partition_compose_instead_of_clobbering() {
+        // SVC-005: a Cloud Run revision rollout runs the old and new hop-relayd for a region at the
+        // same time. Both mount the same identity secret and take the same --region, so both derive
+        // the same node address and open the SAME Firestore partition. Drive two independent store
+        // handles over one partition through the flush path and require the partition's total to be
+        // the SUM of both drains. Against the pre-fix single-row key this asserts 8 and finds 3
+        // (verified by reverting the key shape and re-running): the LAST flush wins, and here that is
+        // the old instance writing its own stale base of 3 back over the new instance's 8, so the new
+        // instance's whole 5-bundle drain vanishes.
+        let durable = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        let tenant: TenantId = [7u8; 16];
+        let hour = 900u64;
+        let now = hour * 3_600_000 + 1_000;
+
+        // The OLD instance opens first and drains 3 bundles / 300 bytes.
+        let mut old = PartitionHandle::open(&durable);
+        let old_key = |h: u64, t: &TenantId| usage_kv_key_for(h, t, "0000000000000001");
+        merge_rows_into_store(
+            &mut old,
+            &[(
+                tenant,
+                Usage {
+                    bundles: 3,
+                    payload_bytes: 300,
+                },
+            )],
+            now,
+            old_key,
+        );
+
+        // The NEW instance opens while the old one is still serving, and drains 5 / 500. Its own
+        // flush lands FIRST; the old instance then flushes again from its own stale in-memory base.
+        let mut new = PartitionHandle::open(&durable);
+        let new_key = |h: u64, t: &TenantId| usage_kv_key_for(h, t, "0000000000000002");
+        merge_rows_into_store(
+            &mut new,
+            &[(
+                tenant,
+                Usage {
+                    bundles: 5,
+                    payload_bytes: 500,
+                },
+            )],
+            now,
+            new_key,
+        );
+        merge_rows_into_store(&mut old, &[(tenant, Usage::default())], now, old_key);
+
+        assert_eq!(
+            durable_usage_total(&durable, hour, &tenant),
+            Usage {
+                bundles: 8,
+                payload_bytes: 800
+            },
+            "the partition total must be the sum of every writer's drain, not the last writer's view"
+        );
+    }
+
+    #[test]
+    fn the_writer_segment_is_a_well_formed_16_hex_id_and_is_stable_in_process() {
+        // The reconciler only accepts exactly 16 lowercase-hex chars as the 4th segment, so a
+        // malformed id here would make every row this relay writes unbillable.
+        let id = ledger_writer_id();
+        assert_eq!(id.len(), 16, "writer id is 16 hex chars: {id}");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "writer id is lowercase hex: {id}"
+        );
+        assert_eq!(id, ledger_writer_id(), "minted once per process");
+        let tenant: TenantId = [4u8; 16];
+        for key in [
+            usage_kv_key(5, &tenant),
+            carriage_kv_key(5, &tenant),
+            storage_usage_kv_key(5, &tenant),
+        ] {
+            assert!(
+                key.ends_with(&format!("/{id}")),
+                "every ledger prefix is writer-scoped: {key}"
+            );
+            assert_eq!(key.split('/').count(), 4, "exactly four segments: {key}");
+        }
     }
 }
