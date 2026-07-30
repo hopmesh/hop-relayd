@@ -2719,7 +2719,8 @@ mod mailbox {
                 mailbox_route, mailbox_tag, MAILBOX_ROUTE_PREFIX_BYTES, TAG_LEN,
             };
             // F-06 / core-protocol-r2-02: the recipient's mailbox tag (address + epoch 0) is projected
-            // to its 2-byte ROUTING PREFIX; the private header now carries only that prefix (never the
+            // to its `MAILBOX_ROUTE_PREFIX_BYTES` ROUTING PREFIX (1 byte since wire v12); the private
+            // header now carries only that prefix (never the
             // full tag), so the relay's spool key is an anonymity set, not a per-recipient address.
             let route = mailbox_route(&mailbox_tag(seal_to, 0));
             let b = Bundle::create_private(
@@ -2733,7 +2734,7 @@ mod mailbox {
                 BundleOpts::default(),
             )
             .unwrap();
-            // The relay spools/pulls under the route-key: the 2-byte prefix right-padded into a full
+            // The relay spools/pulls under the route-key: the routing prefix right-padded into a full
             // Tag (matching the driver's spoolable_private_bundles / take_wanted_mailboxes keys).
             let mut spool_key = [0u8; TAG_LEN];
             spool_key[..MAILBOX_ROUTE_PREFIX_BYTES].copy_from_slice(&route);
