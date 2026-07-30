@@ -4462,6 +4462,57 @@ mod healthz_tests {
         );
     }
 
+    /// Read an HTTP status line off a test socket without ever using a read timeout as control flow.
+    ///
+    /// The obvious `read_to_string(&mut resp).ok()` is a trap here: it waits for EOF, these handlers
+    /// do not always close, so it returned only when the read timeout fired and then SWALLOWED that
+    /// error. On a loaded host the timeout won a race against the response, the buffer came back
+    /// empty, and the caller's assertion blamed the handler for a slow machine. Seen for real: the
+    /// serve_ws healthz test was the sole FAIL of a 40-step verification run at load average 89, and
+    /// passed in isolation three ways. So: stop at the end of the status line (which is all any caller
+    /// asserts on), and make a genuine read failure a LOUD, distinguishable panic.
+    pub(crate) fn read_status_line(client: &mut TcpStream) -> String {
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut resp = String::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match client.read(&mut byte) {
+                Ok(0) => return resp, // peer closed; whatever arrived is the whole answer
+                Ok(_) => {
+                    resp.push(byte[0] as char);
+                    if resp.ends_with("\r\n") {
+                        return resp; // do not wait for a close that may never come
+                    }
+                }
+                Err(e) => panic!(
+                    "reading the HTTP reply failed before a status line arrived, which is a HOST or \
+                     timeout problem rather than a wrong response: {e}, got so far {resp:?}"
+                ),
+            }
+        }
+    }
+
+    /// Read a whole HTTP response, for callers that assert on the BODY as well as the status line.
+    ///
+    /// serve_healthz closes the socket when it is done, so EOF is the real terminator here and there
+    /// is no need to stop at the status line. What must NOT happen is the old `.ok()`, which turned a
+    /// read failure into an empty string and made the caller's body assertion blame the handler.
+    fn read_full_response(client: &mut TcpStream) -> String {
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut resp = String::new();
+        if let Err(e) = client.read_to_string(&mut resp) {
+            panic!(
+                "reading the HTTP reply failed, which is a HOST or timeout problem rather than a \
+                 wrong response: {e}, got so far {resp:?}"
+            );
+        }
+        resp
+    }
+
     /// Drive serve_healthz over a real loopback socket and return the raw HTTP response.
     fn drive_healthz() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4471,11 +4522,7 @@ mod healthz_tests {
             serve_healthz(sock);
         });
         let mut client = TcpStream::connect(addr).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let mut resp = String::new();
-        client.read_to_string(&mut resp).ok();
+        let resp = read_full_response(&mut client);
         server.join().unwrap();
         resp
     }
@@ -4613,11 +4660,7 @@ mod tcp_framing_tests {
         client
             .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let mut resp = String::new();
-        client.read_to_string(&mut resp).ok();
+        let resp = crate::healthz_tests::read_status_line(&mut client);
         server.join().unwrap();
         assert!(
             resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.1 503"),
