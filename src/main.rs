@@ -3049,7 +3049,7 @@ mod handoff {
 
     use hop_core::bundle::BundleId;
     use hop_core::crypto::{PubKeyBytes, Tag};
-    use hop_store_firestore::Presence;
+    use hop_store_firestore::{Presence, PresenceIndex, PresenceKey};
 
     use super::mailbox::{evict_expired, process_mailbox, MailboxStore};
     use super::{now_ms, region_node_b58, DurabilityHandle, Ev, EventTx};
@@ -3092,6 +3092,9 @@ mod handoff {
         let (snap_tx, snap_rx) = mpsc::sync_channel::<Snapshot>(1);
         {
             let presence = Presence::new(&project);
+            // sec-relay-p1-01: the fleet-shared seed already keys every region's node identity, so it
+            // is the natural (and only) secret every relay agrees on for the presence index.
+            let presence_key = PresenceKey::from_fleet_seed(&base_seed);
             let region = region.clone();
             let known_relays = known_relays.clone();
             let ev_tx = ev_tx.clone();
@@ -3117,22 +3120,31 @@ mod handoff {
                     evict_expired(&mut handed, snap.now_ms);
                     evict_expired(&mut spooled, snap.now_ms);
                     evict_expired(&mut pulled, snap.now_ms);
-                    // Record presence for connected device peers (skip peer relays).
+                    // Record presence for connected device peers (skip peer relays). sec-relay-p1-01:
+                    // filed under the fleet-keyed PresenceIndex, so the durable record maps an opaque
+                    // id to a region instead of publishing this relay's connected-device roster as a
+                    // plaintext address→location log. The relay process still KNOWS the address (Noise
+                    // XX authenticates it, DESIGN.md §39 "What a relay still learns"); this only stops
+                    // it being written down where a reader of the database, a backup, or a leaked
+                    // read-only credential would find it.
                     for dev in &snap.devices {
                         let b58 = bs58::encode(dev).into_string();
                         if known_relays.lock().unwrap().contains(&b58) {
                             continue;
                         }
-                        if let Err(e) = presence.set_presence(&b58, &region, snap.now_ms) {
+                        let index = PresenceIndex::of(&presence_key, dev);
+                        if let Err(e) = presence.set_presence(&index, &region, snap.now_ms) {
                             durability.mark_not_ready();
                             eprintln!("handoff: set_presence failed: {e}");
                         }
                     }
-                    // Hand off what we can't deliver locally to the dest device's region.
+                    // Hand off what we can't deliver locally to the dest device's region. The lookup
+                    // derives the same index from the destination address the bundle already names in
+                    // cleartext, so keying the collection costs cross-region routing nothing.
                     for (id, dst, bytes, expires) in &snap.undeliverable {
-                        let dst_b58 = bs58::encode(dst).into_string();
+                        let dst_index = PresenceIndex::of(&presence_key, dst);
                         let dst_region =
-                            match presence.region_of(&dst_b58, snap.now_ms, PRESENCE_TTL_MS) {
+                            match presence.region_of(&dst_index, snap.now_ms, PRESENCE_TTL_MS) {
                                 Ok(Some(r)) => r,
                                 Ok(None) => continue, // unknown/stale, nowhere to hand off yet
                                 Err(e) => {
