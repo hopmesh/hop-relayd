@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- rustfmt drift and two overstated lines in the sec-relay-p1 write-up (b25d258)
+- stop a test hang-guard from being its own flake (a0f93a8)
 - revive dead ingest, fail closed, bound stamps, measure bytes and carriage (1912c75)
 - integrate the storage dimension onto current main (aedcfb2)
 - reap slowloris on raw-TCP and the WS handshake (ADV18-04/05) (4aab3fa)
@@ -29,6 +31,8 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- record the relay link-identity gap, and what sec-relay-p1 did and did not close (951093a)
+- regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
 - regenerate from conventional commits (e19ed95)
 - regenerate from conventional commits (7a81fb6)
@@ -53,6 +57,7 @@ git-cliff. Do not edit by hand.
 - §35 carriage stamps - keyed relays, per-bundle metering (wire v8) (4aae50f)
 
 ### Other
+- key the presence index, de-fingerprint the delivery vaccine (e25fff5)
 - say plainly that SVC-001's literal wording is not met, not that it is (133b36f)
 - make the writer-scoped ledger readable end to end, and stop overclaiming (5ee2555)
 - writer-scope the usage ledger rows so concurrent flushes compose (SVC-005) (b66cac9)
