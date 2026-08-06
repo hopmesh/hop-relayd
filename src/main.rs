@@ -4483,10 +4483,31 @@ mod healthz_tests {
     /// serve_ws healthz test was the sole FAIL of a 40-step verification run at load average 89, and
     /// passed in isolation three ways. So: stop at the end of the status line (which is all any caller
     /// asserts on), and make a genuine read failure a LOUD, distinguishable panic.
+    /// How long a test socket read may take before it is called a host problem.
+    const READ_GUARD: Duration = Duration::from_secs(30);
+
+    /// Install the read hang-guard, tolerating the ONE failure mode that is not a defect.
+    ///
+    /// `set_read_timeout` is a hang-guard here, never part of any assertion, and `.unwrap()` on it was
+    /// its own flake. On macOS, installing a timeout on a socket whose peer has ALREADY answered and
+    /// closed returns EINVAL ("Invalid argument"), because the connection is in a terminal state, and
+    /// these handlers do exactly that: `serve_ws(Healthz)` and `serve_healthz` write their response
+    /// and close. So the option install races the server thread, and losing that race failed the test
+    /// with an OS error that has nothing to do with the behaviour under test. It fired on
+    /// `serve_ws_dispatches_healthz_to_the_health_handler` roughly one full-suite run in ten on a
+    /// loaded machine, which is the same test the status-line helper below was already written for,
+    /// one layer down.
+    ///
+    /// Best effort plus a wall-clock deadline in the caller's loop, rather than a hard unwrap. The
+    /// case where the install fails is precisely the case where the socket is finished, so a read on
+    /// it returns immediately and cannot hang; the deadline covers a partial response arriving slowly.
+    fn arm_read_guard(client: &mut TcpStream) -> Instant {
+        let _ = client.set_read_timeout(Some(READ_GUARD));
+        Instant::now() + READ_GUARD
+    }
+
     pub(crate) fn read_status_line(client: &mut TcpStream) -> String {
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+        let deadline = arm_read_guard(client);
         let mut resp = String::new();
         let mut byte = [0u8; 1];
         loop {
@@ -4503,6 +4524,11 @@ mod healthz_tests {
                      timeout problem rather than a wrong response: {e}, got so far {resp:?}"
                 ),
             }
+            assert!(
+                Instant::now() < deadline,
+                "no status line within {READ_GUARD:?}, which is a HOST problem rather than a wrong \
+                 response: got so far {resp:?}"
+            );
         }
     }
 
@@ -4512,9 +4538,11 @@ mod healthz_tests {
     /// is no need to stop at the status line. What must NOT happen is the old `.ok()`, which turned a
     /// read failure into an empty string and made the caller's body assertion blame the handler.
     fn read_full_response(client: &mut TcpStream) -> String {
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+        // Same best-effort hang-guard as read_status_line: serve_healthz answers and closes, so this
+        // install races the server thread exactly the same way and a hard unwrap would be the same
+        // flake one function over. Scope matters here: fixing only the helper that had been seen to
+        // fail would leave the identical race live under a different name.
+        let _ = arm_read_guard(client);
         let mut resp = String::new();
         if let Err(e) = client.read_to_string(&mut resp) {
             panic!(
