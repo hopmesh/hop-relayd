@@ -31,6 +31,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (7160289)
 - record the relay link-identity gap, and what sec-relay-p1 did and did not close (951093a)
 - regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
